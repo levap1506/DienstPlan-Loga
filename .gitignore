@@ -1,0 +1,4 @@
+/cache/*.json
+/logs/*.log
+/logs/*.old
+/schwarzw*.har

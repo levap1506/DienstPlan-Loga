@@ -1,0 +1,477 @@
+<?php
+/**
+ * LOGA Portal - Shift Puller
+ * 
+ * Pulls shift data from processed LOGA cache into the local DienstPlan database.
+ * Compares LOGA shifts with local plan entries, detects differences,
+ * supports preview mode and 4-strategy conflict resolution:
+ *   1) sync-clean-only  — skip any conflicts, apply only non-conflicting
+ *   2) keep-local-all   — always keep local values
+ *   3) keep-remote-all  — always overwrite with LOGA values
+ *   4) per-conflict      — apply per-item resolution from UI
+ * 
+ * Also handles deletion detection (local shifts not in LOGA).
+ * 
+ * @author  DienstPlan System
+ * @date    2026-04-17
+ */
+
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/LogaLogger.php';
+require_once __DIR__ . '/LogaProcessor.php';
+
+class LogaShiftPuller {
+    private mysqli $conn;
+    private LogaLogger $logger;
+    private LogaProcessor $processor;
+
+    public function __construct(mysqli $conn, ?LogaLogger $logger = null, ?LogaProcessor $processor = null) {
+        $this->conn = $conn;
+        $this->logger = $logger ?? LogaLogger::getInstance();
+        $this->processor = $processor ?? new LogaProcessor($conn, $this->logger);
+    }
+
+    /**
+     * Preview shift differences (dry run).
+     * Returns an array of differences for the UI conflict resolution panel.
+     * 
+     * @param array  $personsShifts Processed shift data from LogaProcessor
+     * @param string $dateFrom      Start date YYYY-MM-DD
+     * @param string $dateTo        End date YYYY-MM-DD
+     * @return array { differences: [...], summary: {...} }
+     */
+    public function preview(array $personsShifts, string $dateFrom, string $dateTo): array {
+        $this->logger->info("Preview shift pull for {$dateFrom} to {$dateTo}", 'ShiftPuller');
+
+        $shiftToCellvalue = $this->processor->getShiftToCellvalueMap();
+        $pnrToUid = $this->processor->getPnrToUidMap();
+        $uidToName = $this->processor->getUidToNameMap();
+        $cellValueAbbrs = $this->processor->getCellValueAbbrs();
+
+        $differences = [];
+        $matchCount = 0;
+
+        // Check each LOGA shift against local DB
+        foreach ($personsShifts as $person) {
+            $uid = $pnrToUid[$person['pnr']] ?? null;
+            if (!$uid) continue;
+            $userName = $uidToName[$uid] ?? "PNR {$person['pnr']}";
+
+            // Group shifts by date: take first mapped cellvalue per date
+            $dateShifts = $this->groupShiftsByDate($person['dates'], $shiftToCellvalue);
+
+            foreach ($dateShifts as $date => $shiftInfo) {
+                $logaCellId = $shiftInfo['cellvalueid'];
+                $localValid = $this->getLocalPlanEntry($date, $uid);
+
+                if ($localValid !== null && (int)$localValid === $logaCellId) {
+                    $matchCount++;
+                    continue;
+                }
+
+                $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[(int)$localValid] ?? '-') : '-';
+                $cloudAbbr = $cellValueAbbrs[$logaCellId] ?? $shiftInfo['shortcut'];
+
+                $differences[] = [
+                    'uid'         => $uid,
+                    'date'        => $date,
+                    'userName'    => $userName,
+                    'cloudShift'  => $cloudAbbr,
+                    'cloudCellId' => $logaCellId,
+                    'localShift'  => $localAbbr,
+                    'localCellId' => $localValid,
+                    'key'         => $uid . '|' . $date,
+                    'action'      => ($localValid !== null) ? 'update' : 'insert',
+                ];
+            }
+        }
+
+        // Deletion detection: local shifts no longer in LOGA
+        $deletions = $this->detectDeletions($personsShifts, $pnrToUid, $uidToName, $cellValueAbbrs, $shiftToCellvalue, $dateFrom, $dateTo);
+        $differences = array_merge($differences, $deletions);
+
+        $this->logger->info(
+            "Preview complete: " . count($differences) . " differences, {$matchCount} matches",
+            'ShiftPuller'
+        );
+
+        return [
+            'differences' => $differences,
+            'summary'     => [
+                'total'      => count($differences),
+                'matches'    => $matchCount,
+                'inserts'    => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'insert')),
+                'updates'    => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'update')),
+                'deletions'  => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'delete')),
+            ],
+        ];
+    }
+
+    /**
+     * Apply shift pull with a given conflict resolution strategy.
+     * 
+     * @param array  $personsShifts Processed shift data from LogaProcessor
+     * @param string $dateFrom      Start date YYYY-MM-DD
+     * @param string $dateTo        End date YYYY-MM-DD
+     * @param string $strategy      One of: sync-clean-only, keep-local-all, keep-remote-all, per-conflict
+     * @param array  $resolutions   For per-conflict strategy: ['uid|date' => 'keep-local'|'keep-remote'|'skip']
+     * @param bool   $isApiCall     Whether running inside API context (direct function call)
+     * @return array Result summary
+     */
+    public function apply(
+        array $personsShifts,
+        string $dateFrom,
+        string $dateTo,
+        string $strategy = 'sync-clean-only',
+        array $resolutions = [],
+        bool $isApiCall = false
+    ): array {
+        $this->logger->info("Applying shift pull ({$strategy}) for {$dateFrom} to {$dateTo}", 'ShiftPuller');
+
+        $shiftToCellvalue = $this->processor->getShiftToCellvalueMap();
+        $pnrToUid = $this->processor->getPnrToUidMap();
+        $uidToName = $this->processor->getUidToNameMap();
+        $cellValueAbbrs = $this->processor->getCellValueAbbrs();
+
+        // ── Exclusive-cellvalue enforcement ─────────────────────────────────
+        // 'hd' and 'vd' may be held by at most ONE user per day.
+        // This rule cannot be bypassed by any strategy.
+        $exclusiveIds   = array_values($this->processor->getExclusiveCellValueIds(['hd', 'vd']));
+        // ownership map:  "cellvalueid|date" => uid (who currently owns it)
+        $exclusiveOwners = $this->loadExclusiveOwnership($exclusiveIds, $dateFrom, $dateTo);
+        // ────────────────────────────────────────────────────────────────────
+
+        $counts = [
+            'inserted'   => 0,
+            'updated'    => 0,
+            'deleted'    => 0,
+            'skipped'    => 0,
+            'keptLocal'  => 0,
+            'errors'     => 0,
+        ];
+
+        // ── Phase 1: Deletions first ─────────────────────────────────────────
+        // Process removals before inserts so that exclusive slots freed by a
+        // deletion are immediately available for the incoming insert on the
+        // same date (e.g. user A loses 'hd', user B gains 'hd').
+        $deletionResult = $this->applyDeletions($personsShifts, $pnrToUid, $uidToName, $cellValueAbbrs, $shiftToCellvalue, $dateFrom, $dateTo, $strategy, $resolutions, $isApiCall);
+        $counts['deleted']   += $deletionResult['deleted'];
+        $counts['keptLocal'] += $deletionResult['keptLocal'];
+        $counts['errors']    += $deletionResult['errors'];
+
+        // Refresh ownership map: deletions may have freed exclusive slots
+        if (!empty($deletionResult['deleted'])) {
+            $exclusiveOwners = $this->loadExclusiveOwnership($exclusiveIds, $dateFrom, $dateTo);
+        }
+
+        // ── Phase 2: Inserts / Updates ───────────────────────────────────────
+        foreach ($personsShifts as $person) {
+            $uid = $pnrToUid[$person['pnr']] ?? null;
+            if (!$uid) continue;
+            $userName = $uidToName[$uid] ?? "PNR {$person['pnr']}";
+
+            $dateShifts = $this->groupShiftsByDate($person['dates'], $shiftToCellvalue);
+
+            foreach ($dateShifts as $date => $shiftInfo) {
+                $logaCellId = $shiftInfo['cellvalueid'];
+                $localValid = $this->getLocalPlanEntry($date, $uid);
+
+                // Already matching
+                if ($localValid !== null && (int)$localValid === $logaCellId) {
+                    $counts['skipped']++;
+                    continue;
+                }
+
+                $key = $uid . '|' . $date;
+                $isConflict = ($localValid !== null);
+
+                // Resolve conflict based on strategy
+                if ($isConflict) {
+                    $action = $this->resolveConflict($strategy, $key, $resolutions);
+                    if ($action === 'keep-local') {
+                        $counts['keptLocal']++;
+                        $localAbbr = $cellValueAbbrs[(int)$localValid] ?? '-';
+                        $this->logger->info("Keeping local shift '{$localAbbr}' for {$userName} on {$date}", 'ShiftPuller');
+                        continue;
+                    }
+                    if ($action === 'skip') {
+                        $counts['skipped']++;
+                        continue;
+                    }
+                    // action === 'keep-remote' → fall through to apply
+                }
+
+                // Apply LOGA value
+                $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[(int)$localValid] ?? '-') : '-';
+                $cloudAbbr = $cellValueAbbrs[$logaCellId] ?? $shiftInfo['shortcut'];
+
+                // ── Exclusive-cellvalue guard ────────────────────────────────
+                if (in_array($logaCellId, $exclusiveIds, true)) {
+                    $ownerKey = $logaCellId . '|' . $date;
+                    $currentOwner = $exclusiveOwners[$ownerKey] ?? null;
+                    if ($currentOwner !== null && $currentOwner !== $uid) {
+                        $ownerName = $uidToName[$currentOwner] ?? "UID {$currentOwner}";
+                        $this->logger->error(
+                            "BLOCKED exclusive shift '{$cloudAbbr}' for {$userName} on {$date}: "
+                            . "already held by {$ownerName} — rule cannot be overridden",
+                            'ShiftPuller'
+                        );
+                        $counts['skipped']++;
+                        continue;
+                    }
+                }
+                // ─────────────────────────────────────────────────────────────
+
+                $result = $this->applyPlanEntry($uid, $date, $logaCellId, $isApiCall);
+                if ($result) {
+                    $op = strtoupper($result['operation'] ?? '');
+                    if ($op === 'INSERT') $counts['inserted']++;
+                    elseif ($op === 'UPDATE') $counts['updated']++;
+                    else $counts['skipped']++;
+
+                    $actionLabel = ($op === 'INSERT') ? 'Inserted' : 'Updated';
+                    $this->logger->info("{$actionLabel} shift: {$userName} on {$date} - '{$localAbbr}' → '{$cloudAbbr}'", 'ShiftPuller');
+
+                    // Update in-run ownership so subsequent writes in this batch are also blocked
+                    if (in_array($logaCellId, $exclusiveIds, true)) {
+                        $exclusiveOwners[$logaCellId . '|' . $date] = $uid;
+                    }
+                } else {
+                    $counts['errors']++;
+                }
+            }
+        }
+
+        $this->logger->info(
+            "Shift pull complete: {$counts['inserted']} inserted, {$counts['updated']} updated, "
+            . "{$counts['deleted']} deleted, {$counts['skipped']} unchanged, "
+            . "{$counts['keptLocal']} kept local, {$counts['errors']} errors",
+            'ShiftPuller'
+        );
+
+        return $counts;
+    }
+
+    // ─── Internal Helpers ───────────────────────────────────────────────────
+
+    /**
+     * Group shifts by date, taking the first mapped cellvalue per date.
+     */
+    private function groupShiftsByDate(array $dates, array $shiftToCellvalue): array {
+        $dateShifts = [];
+        foreach ($dates as $entry) {
+            $shiftId = $entry['id'];
+            if (isset($shiftToCellvalue[$shiftId])) {
+                $date = $entry['date'];
+                if (!isset($dateShifts[$date])) {
+                    $dateShifts[$date] = [
+                        'cellvalueid' => $shiftToCellvalue[$shiftId]['cellvalueid'],
+                        'shortcut'    => $shiftToCellvalue[$shiftId]['shortcut'],
+                    ];
+                }
+            }
+        }
+        return $dateShifts;
+    }
+
+    /**
+     * Get the local plan entry for a given date + uid.
+     */
+    private function getLocalPlanEntry(string $date, int $uid): ?int {
+        $stmt = $this->conn->prepare("SELECT valid FROM plan WHERE datum = ? AND uid = ?");
+        $stmt->bind_param("si", $date, $uid);
+        $stmt->execute();
+        $stmt->store_result();
+
+        $valid = null;
+        if ($stmt->num_rows > 0) {
+            $stmt->bind_result($valid);
+            $stmt->fetch();
+        }
+
+        $stmt->free_result();
+        $stmt->close();
+
+        return $valid !== null ? (int)$valid : null;
+    }
+
+    /**
+     * Resolve a conflict based on strategy.
+     * Returns: 'keep-local', 'keep-remote', or 'skip'
+     */
+    private function resolveConflict(string $strategy, string $key, array $resolutions): string {
+        return match ($strategy) {
+            'keep-local-all'  => 'keep-local',
+            'keep-remote-all' => 'keep-remote',
+            'per-conflict'    => $resolutions[$key] ?? 'skip',
+            default           => 'skip', // sync-clean-only
+        };
+    }
+
+    /**
+     * Detect local shifts that are no longer in LOGA (for deletion).
+     */
+    private function detectDeletions(
+        array $personsShifts,
+        array $pnrToUid,
+        array $uidToName,
+        array $cellValueAbbrs,
+        array $shiftToCellvalue,
+        string $dateFrom,
+        string $dateTo
+    ): array {
+        $deletions = [];
+
+        if ($dateFrom === '' || $dateTo === '') return $deletions;
+
+        // Collect LOGA-managed cellvalue IDs
+        $logaManagedCellvalues = array_unique(array_map(fn($s) => $s['cellvalueid'], $shiftToCellvalue));
+        if (empty($logaManagedCellvalues)) return $deletions;
+
+        // Build set of LOGA dates per uid
+        $logaDatesPerUid = [];
+        foreach ($personsShifts as $person) {
+            $uid = $pnrToUid[$person['pnr']] ?? null;
+            if (!$uid) continue;
+            if (!isset($logaDatesPerUid[$uid])) $logaDatesPerUid[$uid] = [];
+            foreach ($person['dates'] as $entry) {
+                $shiftId = $entry['id'];
+                if (isset($shiftToCellvalue[$shiftId])) {
+                    $logaDatesPerUid[$uid][$entry['date']] = true;
+                }
+            }
+        }
+
+        // Query local plan entries with LOGA-managed cell values
+        $allLogaUids = array_values($pnrToUid);
+        if (empty($allLogaUids)) return $deletions;
+
+        $uidPlaceholders = implode(',', array_fill(0, count($allLogaUids), '?'));
+        $cvPlaceholders = implode(',', array_fill(0, count($logaManagedCellvalues), '?'));
+        $query = "SELECT uid, datum, valid FROM plan WHERE uid IN ({$uidPlaceholders}) AND datum BETWEEN ? AND ? AND valid IN ({$cvPlaceholders})";
+
+        $stmt = $this->conn->prepare($query);
+        $types = str_repeat('i', count($allLogaUids)) . 'ss' . str_repeat('i', count($logaManagedCellvalues));
+        $params = array_merge($allLogaUids, [$dateFrom, $dateTo], $logaManagedCellvalues);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        while ($row = $result->fetch_assoc()) {
+            $uid = (int)$row['uid'];
+            $localDate = $row['datum'];
+            $localCellId = (int)$row['valid'];
+            $userName = $uidToName[$uid] ?? "UID {$uid}";
+
+            // If LOGA has no shift for this user on this date → mark for deletion
+            if (!isset($logaDatesPerUid[$uid][$localDate])) {
+                $localAbbr = $cellValueAbbrs[$localCellId] ?? '-';
+                $deletions[] = [
+                    'uid'         => $uid,
+                    'date'        => $localDate,
+                    'userName'    => $userName,
+                    'cloudShift'  => '-',
+                    'cloudCellId' => 0,
+                    'localShift'  => $localAbbr,
+                    'localCellId' => $localCellId,
+                    'key'         => $uid . '|' . $localDate,
+                    'action'      => 'delete',
+                ];
+            }
+        }
+
+        $stmt->close();
+        return $deletions;
+    }
+
+    /**
+     * Apply deletions based on strategy.
+     */
+    private function applyDeletions(
+        array $personsShifts,
+        array $pnrToUid,
+        array $uidToName,
+        array $cellValueAbbrs,
+        array $shiftToCellvalue,
+        string $dateFrom,
+        string $dateTo,
+        string $strategy,
+        array $resolutions,
+        bool $isApiCall
+    ): array {
+        $counts = ['deleted' => 0, 'keptLocal' => 0, 'errors' => 0];
+
+        $deletions = $this->detectDeletions($personsShifts, $pnrToUid, $uidToName, $cellValueAbbrs, $shiftToCellvalue, $dateFrom, $dateTo);
+
+        foreach ($deletions as $diff) {
+            $key = $diff['key'];
+            $action = $this->resolveConflict($strategy, $key, $resolutions);
+
+            if ($action === 'keep-local') {
+                $counts['keptLocal']++;
+                $this->logger->info("Keeping local shift '{$diff['localShift']}' for {$diff['userName']} on {$diff['date']}", 'ShiftPuller');
+                continue;
+            }
+            if ($action === 'skip') {
+                // Deletions are always conflicts (local exists, remote doesn't).
+                // 'skip' means: no resolution was provided (per-conflict with no UI input)
+                // or strategy is sync-clean-only — in both cases, leave local untouched.
+                $counts['keptLocal']++;
+                continue;
+            }
+
+            // Delete (set optionData=0)
+            $result = $this->applyPlanEntry($diff['uid'], $diff['date'], 0, $isApiCall);
+            if ($result) {
+                $counts['deleted']++;
+                $this->logger->info("Deleted shift: {$diff['userName']} on {$diff['date']} - '{$diff['localShift']}' → '-' (not in LOGA)", 'ShiftPuller');
+            } else {
+                $counts['errors']++;
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Pre-load current exclusive-cellvalue ownership for a date range.
+     * Returns [ "cellvalueid|date" => uid ]
+     */
+    private function loadExclusiveOwnership(array $exclusiveIds, string $dateFrom, string $dateTo): array {
+        if (empty($exclusiveIds)) return [];
+
+        $placeholders = implode(',', array_fill(0, count($exclusiveIds), '?'));
+        $stmt = $this->conn->prepare(
+            "SELECT uid, datum, valid FROM plan "
+            . "WHERE datum BETWEEN ? AND ? AND valid IN ({$placeholders})"
+        );
+        $types = 'ss' . str_repeat('i', count($exclusiveIds));
+        $params = array_merge([$dateFrom, $dateTo], $exclusiveIds);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $map = [];
+        while ($row = $result->fetch_assoc()) {
+            $key = (int)$row['valid'] . '|' . $row['datum'];
+            $map[$key] = (int)$row['uid'];
+        }
+        $stmt->close();
+        return $map;
+    }
+
+    /**
+     * Apply a single plan entry via internal API.
+     */
+    private function applyPlanEntry(int $uid, string $date, int $cellValueId, bool $isApiCall): ?array {
+        try {
+            return $this->processor->callInternalApi('update_calendar', [
+                'optionData'   => $cellValueId,
+                'targetDatum'  => $date,
+                'targetPerson' => $uid,
+            ], $isApiCall);
+        } catch (\Exception $e) {
+            $this->logger->error("Failed to apply plan entry for UID {$uid} on {$date}: " . $e->getMessage(), 'ShiftPuller');
+            return null;
+        }
+    }
+}
