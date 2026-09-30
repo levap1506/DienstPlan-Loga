@@ -34,9 +34,15 @@ class ProcessLock {
      * 
      * @param string $mode    Current operation mode
      * @param string $user    Current user name
+     * @param bool   $force   If true, force-release any existing lock before acquiring
      * @return bool
      */
-    public function acquire(string $mode = 'unknown', string $user = 'unknown'): bool {
+    public function acquire(string $mode = 'unknown', string $user = 'unknown', bool $force = false): bool {
+        // Force-release stale or stuck locks when explicitly requested
+        if ($force) {
+            $this->forceRelease();
+        }
+
         // Check for stale lock before attempting
         $this->recoverStaleLock();
 
@@ -84,6 +90,21 @@ class ProcessLock {
             }
 
             $this->logger->debug("Lock released", 'ProcessLock');
+        }
+    }
+
+    /**
+     * Force-release any existing lock, even if held by another process.
+     * Useful for recovering from hung syncs. Removes the lock file so
+     * a fresh acquire() can succeed.
+     */
+    public function forceRelease(): void {
+        if ($this->lockHandle) {
+            $this->release();
+        }
+        if (file_exists($this->lockFile)) {
+            @unlink($this->lockFile);
+            $this->logger->info("Lock force-released (file removed)", 'ProcessLock');
         }
     }
 
@@ -140,7 +161,11 @@ class ProcessLock {
     }
 
     /**
-     * Detect and recover stale locks (PID no longer running + older than threshold).
+     * Detect and recover stale locks.
+     *
+     * A lock is stale if the owning PID is no longer running (crashed process).
+     * If the PID is still alive but the lock age exceeds the timeout, the process
+     * is considered hung and the lock is force-released with a warning.
      */
     private function recoverStaleLock(): void {
         $info = $this->getLockInfo();
@@ -149,22 +174,8 @@ class ProcessLock {
         }
 
         $age = time() - $info['startTime'];
-        if ($age < LOGA_STALE_LOCK_TIMEOUT) {
-            return; // Lock is not old enough to be considered stale
-        }
-
-        // Check if PID is still running (Unix check)
         $pid = $info['pid'];
-        $pidRunning = false;
-
-        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-            // Windows: check via tasklist
-            exec("tasklist /FI \"PID eq {$pid}\" 2>NUL", $output, $returnCode);
-            $pidRunning = count($output) > 1; // tasklist outputs header + process line
-        } else {
-            // Unix: check /proc or kill -0
-            $pidRunning = file_exists("/proc/{$pid}");
-        }
+        $pidRunning = $this->isPidRunning($pid);
 
         if (!$pidRunning) {
             $this->logger->info(
@@ -172,6 +183,20 @@ class ProcessLock {
                 'ProcessLock'
             );
             @unlink($this->lockFile);
+        } elseif ($age >= LOGA_STALE_LOCK_TIMEOUT) {
+            $this->logger->info(
+                "Forcing release of hung lock: PID {$pid} still running but lock held for {$age}s (threshold: " . LOGA_STALE_LOCK_TIMEOUT . "s)",
+                'ProcessLock'
+            );
+            @unlink($this->lockFile);
         }
+    }
+
+    private function isPidRunning(int $pid): bool {
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            exec("tasklist /FI \"PID eq {$pid}\" 2>NUL", $output, $returnCode);
+            return count($output) > 1;
+        }
+        return file_exists("/proc/{$pid}");
     }
 }

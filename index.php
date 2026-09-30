@@ -80,11 +80,12 @@ if ($context !== 'cli') {
 // ─── Parameter Extraction ───────────────────────────────────────────────────
 
 if ($context === 'cli') {
-    $opts = getopt('', ['mode:', 'from:', 'to:', 'force', 'strategy:', 'resolutions:', 'preview']);
+    $opts = getopt('', ['mode:', 'from:', 'to:', 'force', 'lock-force', 'strategy:', 'resolutions:', 'preview']);
     $mode = $opts['mode'] ?? null;
     $dateFrom = $opts['from'] ?? date('Y-m-01');
     $dateTo = $opts['to'] ?? date('Y-m-t');
     $forceRefresh = isset($opts['force']);
+    $forceLock = isset($opts['lock-force']);
     $strategy = $opts['strategy'] ?? 'sync-clean-only';
     $resolutions = isset($opts['resolutions']) ? json_decode($opts['resolutions'], true) : [];
     $previewOnly = isset($opts['preview']);
@@ -93,6 +94,7 @@ if ($context === 'cli') {
     $dateFrom = $_GET['dateFrom'] ?? $_POST['dateFrom'] ?? date('Y-m-01');
     $dateTo = $_GET['dateTo'] ?? $_POST['dateTo'] ?? date('Y-m-t');
     $forceRefresh = filter_var($_GET['force'] ?? $_POST['force'] ?? false, FILTER_VALIDATE_BOOLEAN);
+    $forceLock = filter_var($_GET['forceLock'] ?? $_POST['forceLock'] ?? false, FILTER_VALIDATE_BOOLEAN);
     $strategy = $_GET['strategy'] ?? $_POST['strategy'] ?? 'sync-clean-only';
     $resolutions = [];
     if (!empty($_GET['resolutions'] ?? $_POST['resolutions'] ?? '')) {
@@ -190,7 +192,7 @@ if ($mode === 'explorer-view') {
 // ─── Execute Mode ───────────────────────────────────────────────────────────
 
 if ($mode !== null && in_array($mode, array_keys(LOGA_MODES))) {
-    executeMode($mode, $dateFrom, $dateTo, $forceRefresh, $strategy, $resolutions, $previewOnly, $context);
+    executeMode($mode, $dateFrom, $dateTo, $forceRefresh, $strategy, $resolutions, $previewOnly, $context, $forceLock);
     exit;
 }
 
@@ -211,7 +213,7 @@ if ($context === 'api' || $context === 'cli') {
 // Mode Execution
 // ═══════════════════════════════════════════════════════════════════════════
 
-function executeMode(string $mode, string $dateFrom, string $dateTo, bool $forceRefresh, string $strategy, array $resolutions, bool $previewOnly, string $context): void {
+function executeMode(string $mode, string $dateFrom, string $dateTo, bool $forceRefresh, string $strategy, array $resolutions, bool $previewOnly, string $context, bool $forceLock = false): void {
     global $conn;
 
     // Allow long-running LOGA operations to complete even if nginx drops the
@@ -241,13 +243,25 @@ function executeMode(string $mode, string $dateFrom, string $dateTo, bool $force
 
     // Process lock
     $lock = new ProcessLock($logger);
-    if (!$lock->acquire($mode, $dateFrom . ' - ' . $dateTo)) {
+    if (!$lock->acquire($mode, $dateFrom . ' - ' . $dateTo, $forceLock)) {
         $lockInfo = $lock->getLockInfo();
-        $msg = 'Another LOGA sync is running';
         if ($lockInfo) {
-            $msg .= " (Mode: {$lockInfo['mode']}, Started: " . date('H:i:s', $lockInfo['startTime']). ")";
+            $ageInfo = isset($lockInfo['age'])
+                ? sprintf(' (%d min %d sec ago)', intdiv($lockInfo['age'], 60), $lockInfo['age'] % 60)
+                : '';
+            $msg = "Another LOGA sync is running (Mode: {$lockInfo['mode']}, Started: " . date('H:i:s', $lockInfo['startTime']). "{$ageInfo})";
+            $errorPayload = [
+                'error'     => $msg,
+                'lockMode'  => $lockInfo['mode'] ?? null,
+                'lockAge'   => $lockInfo['age'] ?? null,
+                'lockStart' => $lockInfo['startTimeFormatted'] ?? null,
+                'lockPid'   => $lockInfo['pid'] ?? null,
+            ];
+        } else {
+            $msg = 'Failed to acquire sync lock. Check that the cache directory (' . LOGA_CACHE_DIR . ') is writable by the web server.';
+            $errorPayload = ['error' => $msg];
         }
-        outputResult($context, ['error' => $msg], 423);
+        outputResult($context, $errorPayload, 423);
         return;
     }
 
