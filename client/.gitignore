@@ -1,0 +1,4 @@
+.venv/
+downloads/
+rpc_profiles.json
+__pycache__/
