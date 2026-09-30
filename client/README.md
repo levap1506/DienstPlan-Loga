@@ -4,6 +4,9 @@ Client Python pentru `https://schwarzw.pi-asp.de/loga3`, fără Selenium și fă
 Playwright. Autentificarea folosește HTTP direct (LoginSrv, sesiunea LOGA și
 tokenul XSRF); parola nu este stocată pe disc.
 
+Pentru traseele analizate, endpoint-uri, comportamentul deduplicării și limitele
+soluției, consultați [FINDINGS.md](FINDINGS.md).
+
 ## Ce descarcă
 
 - documentele din „Generierte Dokumente” prin dashboard sau TalentCard;
