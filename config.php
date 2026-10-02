@@ -63,6 +63,39 @@ if (!defined('LOGA_SPECIAL_USERS')) {
     ]);
 }
 
+// ── Per-user base-shift overrides ──────────────────────────────────────────
+// Replace a user's base shift code within a date range.
+// Gutu (PNR 3017484): base shift is AT instead of O from 2026-10-01 to 2027-09-30.
+// Format: pnr => [ ['from' => 'Y-m-d', 'to' => 'Y-m-d', 'fromShift' => 'O', 'toShift' => 'AT'], ... ]
+if (!defined('LOGA_BASE_SHIFT_OVERRIDES')) {
+    define('LOGA_BASE_SHIFT_OVERRIDES', [
+        '3017484' => [
+            ['from' => '2026-10-01', 'to' => '2027-09-30', 'fromShift' => 'O', 'toShift' => 'AT'],
+        ],
+    ]);
+}
+
+// Shift shortcuts that must never be deleted by the pusher (e.g. managed in LOGA).
+if (!defined('LOGA_PROTECTED_SHIFTS')) {
+    define('LOGA_PROTECTED_SHIFTS', ['AT']);
+}
+
+// ── Split creation via privateRPC ──────────────────────────────────────────
+// Captured MaskActionSrv.callMaskAction envelope that creates a Dienstsplit
+// (primary + partner). Placeholders are filled by LogaRpc::fill().
+if (!defined('LOGA_SPLIT_ACTION_TEMPLATE')) {
+    define('LOGA_SPLIT_ACTION_TEMPLATE',
+        '7|3|37|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'
+        . '3jw|2vm|com.piag.lweb.ui.masks.shared.actions.Action|4k9|*|3k0|37f|SBK|'
+        . '4c060823-0fdb-43b0-b988-7377c71f3f49|8lz|4vl|y2em5e3qC1fcZrCggryW|LWSPEP|'
+        . '8mb|5q4|5s5|4vh|8ks|{PARTNER_PNR}|c3ad345f-4112-4414-9ea0-91567242aa59|'
+        . '5w1|{CONTEXT_ROLE_ID}|000|8m7|{FROM_DT}|{TO_DT}|8ke|{OBJS_ID}|{OWNER_PNR}|'
+        . '37j|{SHIFT_ID}|1|2|3|4|5|6|4|7|8|9|10|7|11|12|0|13|LT1|13|LUS|0|0|14|15|16|0|17|18|0|0|0|'
+        . '19|0|0|0|0|0|0|0|0|0|0|8|20|0|21|21|10|1|22|23|24|1|25|14|14|26|27|28|29|30|31|30|32|0|33|0|'
+        . '14|34|23|-14|35|14|14|36|D$gt$|37|36|D$hDh|36|D$g5s|0|36|D$hDh|'
+    );
+}
+
 // ── TTLs & Timeouts (from config/settings.json or defaults) ────────────────
 if (!defined('LOGA_SESSION_TTL')) {
     define('LOGA_SESSION_TTL', (int)(_loga_config_val('LOGA_SESSION_TTL') ?? 1800));

@@ -147,10 +147,61 @@ class LogaClient {
     }
 
     /**
+     * Perform an encrypted privateRPC call (Mask/PEP, DataMining, ServerData, ...).
+     *
+     * @param string $service       Service path after privateRPC/, e.g. 'MaskActionSrv'
+     * @param string $envelope      Plaintext envelope (7|3|...)
+     * @param array  $runtimeConfig Runtime config (logaVersion + xsrfPermutation)
+     * @return string Raw response body
+     */
+    public function privateRpc(string $service, string $envelope, array $runtimeConfig): string {
+        require_once __DIR__ . '/LogaRpc.php';
+
+        if ($this->xsrfToken === '') {
+            throw new \RuntimeException('privateRPC requires an XSRF token');
+        }
+
+        $version     = $runtimeConfig['logaVersion'] ?? '';
+        $moduleBase  = LOGA_BASE_URL . "bts/{$version}/L2Main/";
+        $permutation = $runtimeConfig['xsrfPermutation'] ?? '';
+        $body        = LogaRpc::encryptBody($this->xsrfToken, $envelope);
+        $headers     = LogaRpc::headers($moduleBase, $permutation, $this->xsrfToken);
+        $url         = LOGA_BASE_URL . 'privateRPC/' . $service;
+
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $url,
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $body,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING       => '',
+            CURLOPT_TIMEOUT        => LOGA_CURL_TIMEOUT,
+            CURLOPT_CONNECTTIMEOUT => LOGA_CURL_CONNECT_TIMEOUT,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_COOKIE         => $this->buildCookieString(),
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error    = curl_error($ch);
+        curl_close($ch);
+
+        if ($error) {
+            throw new \RuntimeException("privateRPC cURL error: {$error}");
+        }
+        if ($httpCode !== 200) {
+            throw new \RuntimeException("privateRPC HTTP {$httpCode}: " . substr((string)$response, 0, 300));
+        }
+
+        return (string)$response;
+    }
+
+    /**
      * Make a raw cURL request (low-level, used by gwtRequest and apiRequest).
      */
-    private function execute(string $url, string $payload, array $headers, bool $captureHeaders, string $cookie): string {
-        $this->checkCircuitBreaker();
+    private function execute(string $url, string $payload, array $headers, bool $captureHeaders, string $cookie): string {        $this->checkCircuitBreaker();
 
         $ch = curl_init();
 

@@ -32,6 +32,8 @@ class LogaShiftPusher {
     private string $dateTo;
     private array $holidays = [];
     private array $shiftIdMap = [];
+    /** @var array<int,string> local user id => LOGA PNR */
+    private array $uidToPnr = [];
 
     public function __construct(
         mysqli $conn,
@@ -50,6 +52,30 @@ class LogaShiftPusher {
 
         $this->loadHolidays();
         $this->loadShiftIdMap();
+        $this->loadUidToPnr();
+    }
+
+    private function loadUidToPnr(): void {
+        $result = $this->conn->query("SELECT id, pnr FROM user WHERE pnr IS NOT NULL");
+        while ($row = $result->fetch_assoc()) {
+            $this->uidToPnr[(int)$row['id']] = (string)$row['pnr'];
+        }
+    }
+
+    /**
+     * Apply a per-user base-shift override (e.g. Gutu: AT instead of O within a
+     * date range). Returns the shift unchanged when no rule matches.
+     */
+    private function applyBaseShiftOverride(string $pnr, string $date, string $shift): string {
+        foreach (LOGA_BASE_SHIFT_OVERRIDES[$pnr] ?? [] as $rule) {
+            $from  = $rule['from'] ?? '0000-00-00';
+            $to    = $rule['to'] ?? '9999-12-31';
+            $match = $rule['fromShift'] ?? '';
+            if ($shift === $match && $date >= $from && $date <= $to) {
+                return (string)($rule['toShift'] ?? $shift);
+            }
+        }
+        return $shift;
     }
 
     // ─── Public Interface ───────────────────────────────────────────────────
@@ -379,11 +405,17 @@ class LogaShiftPusher {
             $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
 
             if (!$this->shiftsMatch($expectedShifts, $currentLogaShiftsForDate)) {
+                // Never delete protected shortcuts (e.g. AT is managed in LOGA).
+                $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
+                $toDelete = array_values(array_filter(
+                    $currentLogaShiftsForDate,
+                    fn($s) => !in_array(strtoupper(self::shortcutOf($s)), $protected, true)
+                ));
                 $changes[] = [
                     'date'           => $dateStr,
                     'currentShifts'  => $currentLogaShiftsForDate,
                     'expectedShifts' => $expectedShifts,
-                    'toDelete'       => $currentLogaShiftsForDate,
+                    'toDelete'       => $toDelete,
                     'toAdd'          => $expectedShifts,
                 ];
             }
@@ -442,6 +474,18 @@ class LogaShiftPusher {
         $baseShift = $this->getBaseShift($uid, $date);
         if (!$baseShift) return [];
 
+        // Per-user base-shift override (e.g. Gutu: AT instead of O).
+        $pnr = $this->uidToPnr[$uid] ?? null;
+        if ($pnr !== null) {
+            $baseShift = $this->applyBaseShiftOverride($pnr, $date, $baseShift);
+        }
+        // The 'O' base day shift used by plan value 1 (duty days) can be
+        // overridden independently of the no-plan base shift.
+        $baseDayShift = 'O';
+        if ($pnr !== null) {
+            $baseDayShift = $this->applyBaseShiftOverride($pnr, $date, 'O');
+        }
+
         $isWorkDay = $this->isWorkDay($date);
         $planEntry = $planEntries[$date] ?? null;
 
@@ -461,7 +505,7 @@ class LogaShiftPusher {
         if ($planEntry && (int)$planEntry['valid'] === 1) {
             $suffix = $this->getOSuffix($date);
             return $isWorkDay
-                ? [self::makeShift('O'), self::makeShift("O{$suffix}", $split)]
+                ? [self::makeShift($baseDayShift), self::makeShift("O{$suffix}", $split)]
                 : [self::makeShift("O{$suffix}", $split)];
         }
 
