@@ -20,6 +20,7 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/LogaLogger.php';
 require_once __DIR__ . '/LogaClient.php';
 require_once __DIR__ . '/LogaAuth.php';
+require_once __DIR__ . '/LogaProcessor.php';
 
 class LogaShiftPusher {
     private mysqli $conn;
@@ -312,7 +313,8 @@ class LogaShiftPusher {
 
     /**
      * Extract current shift state from LOGA data.
-     * Returns: [pnr => [date => [shortcut1, shortcut2, ...]]]
+     * Returns: [pnr => [date => [ shiftStruct, ... ]]]
+     * where a shiftStruct is ['shortcut','splitId','order','timeFrom','timeTo','endsNextDay'].
      */
     private function extractCurrentShifts(array $logaData): array {
         $currentShifts = [];
@@ -326,7 +328,18 @@ class LogaShiftPusher {
                 $shifts = [];
                 foreach ($shiftDay['shifts'] as $shift) {
                     $sc = $shift['shortcut'] ?? null;
-                    if ($sc) $shifts[] = $sc;
+                    if (!$sc) continue;
+
+                    $split    = is_array($shift['shiftSplitData'] ?? null) ? $shift['shiftSplitData'] : null;
+                    $interval = is_array($shift['timeInterval'] ?? null) ? $shift['timeInterval'] : null;
+                    $shifts[] = [
+                        'shortcut'    => $sc,
+                        'splitId'     => $split['splitShift_id'] ?? null,
+                        'order'       => isset($split['order']) ? (int)$split['order'] : null,
+                        'timeFrom'    => self::normalizeTime($interval['timeFrom'] ?? null),
+                        'timeTo'      => self::normalizeTime($interval['timeTo'] ?? null),
+                        'endsNextDay' => !empty($interval['endsNextDay']),
+                    ];
                 }
                 if (!empty($shifts)) {
                     $currentShifts[$pnr][$date] = $shifts;
@@ -383,16 +396,27 @@ class LogaShiftPusher {
 
     /**
      * Get plan entries for a user in the sync range.
+     * Returns [ date => ['valid','splitId','splitOrder','timeFrom','timeTo','endsNextDay'] ].
      */
     private function getPlanEntries(int $uid): array {
-        $stmt = $this->conn->prepare("SELECT datum, valid FROM plan WHERE uid = ? AND datum BETWEEN ? AND ? AND valid IN (1, 2)");
+        $stmt = $this->conn->prepare(
+            "SELECT datum, valid, split_id, split_order, time_from, time_to, ends_next_day "
+            . "FROM plan WHERE uid = ? AND datum BETWEEN ? AND ? AND valid IN (1, 2)"
+        );
         $stmt->bind_param("iss", $uid, $this->dateFrom, $this->dateTo);
         $stmt->execute();
         $result = $stmt->get_result();
 
         $entries = [];
         while ($row = $result->fetch_assoc()) {
-            $entries[$row['datum']] = $row['valid'];
+            $entries[$row['datum']] = [
+                'valid'       => (int)$row['valid'],
+                'splitId'     => $row['split_id'] ?? null,
+                'splitOrder'  => $row['split_order'] !== null ? (int)$row['split_order'] : null,
+                'timeFrom'    => self::normalizeTime($row['time_from'] ?? null),
+                'timeTo'      => self::normalizeTime($row['time_to'] ?? null),
+                'endsNextDay' => !empty($row['ends_next_day']),
+            ];
         }
         $stmt->close();
         return $entries;
@@ -401,6 +425,7 @@ class LogaShiftPusher {
     /**
      * Calculate expected shifts for a user/date.
      * Handles special users and regular users differently.
+     * Returns an array of shift structs: ['shortcut','splitId','order','timeFrom','timeTo','endsNextDay'].
      */
     private function calculateExpectedShifts($userIdOrPnr, string $date, array $planEntries): array {
         // Special users (identified by PNR string; cast because PHP coerces numeric string keys to int)
@@ -409,7 +434,7 @@ class LogaShiftPusher {
             $shift = LOGA_SPECIAL_USERS[$pnrKey]['shift'];
             $workdaysOnly = LOGA_SPECIAL_USERS[$pnrKey]['workdaysOnly'] ?? true;
 
-            return ($workdaysOnly && !$this->isWorkDay($date)) ? [] : [$shift];
+            return ($workdaysOnly && !$this->isWorkDay($date)) ? [] : [self::makeShift($shift)];
         }
 
         // Regular user (integer UID)
@@ -418,38 +443,126 @@ class LogaShiftPusher {
         if (!$baseShift) return [];
 
         $isWorkDay = $this->isWorkDay($date);
-        $planValue = $planEntries[$date] ?? null;
+        $planEntry = $planEntries[$date] ?? null;
+
+        // Split metadata applies to the suffixed ("real") shift of the plan entry.
+        $split = null;
+        if (is_array($planEntry) && !empty($planEntry['splitId'])) {
+            $split = [
+                'splitId'     => $planEntry['splitId'],
+                'order'       => $planEntry['splitOrder'] ?? null,
+                'timeFrom'    => $planEntry['timeFrom'] ?? null,
+                'timeTo'      => $planEntry['timeTo'] ?? null,
+                'endsNextDay' => !empty($planEntry['endsNextDay']),
+            ];
+        }
 
         // Plan value 1 = O shifts
-        if ($planValue == 1) {
+        if ($planEntry && (int)$planEntry['valid'] === 1) {
             $suffix = $this->getOSuffix($date);
             return $isWorkDay
-                ? ['O', "O{$suffix}"]
-                : ["O{$suffix}"];
+                ? [self::makeShift('O'), self::makeShift("O{$suffix}", $split)]
+                : [self::makeShift("O{$suffix}", $split)];
         }
 
         // Plan value 2 = R shifts
-        if ($planValue == 2) {
+        if ($planEntry && (int)$planEntry['valid'] === 2) {
             $suffix = $this->getOSuffix($date);
             $rShift = $this->getRShiftWithSuffix($suffix);
             return $isWorkDay
-                ? ['R', $rShift]
-                : [$rShift];
+                ? [self::makeShift('R'), self::makeShift($rShift, $split)]
+                : [self::makeShift($rShift, $split)];
         }
 
         // No plan entry: base shift on workdays, nothing on weekends
-        return $isWorkDay ? [$baseShift] : [];
+        return $isWorkDay ? [self::makeShift($baseShift)] : [];
     }
 
     /**
-     * Compare two shift arrays (order-insensitive).
+     * Build a normalized shift struct.
+     */
+    private static function makeShift(string $shortcut, ?array $split = null): array {
+        return [
+            'shortcut'    => $shortcut,
+            'splitId'     => $split['splitId'] ?? null,
+            'order'       => $split['order'] ?? null,
+            'timeFrom'    => $split['timeFrom'] ?? null,
+            'timeTo'      => $split['timeTo'] ?? null,
+            'endsNextDay' => !empty($split['endsNextDay']),
+        ];
+    }
+
+    /**
+     * Normalize a LOGA/DB time value ("08:30:00.000") into "HH:MM:SS".
+     */
+    private static function normalizeTime(?string $value): ?string {
+        if ($value === null || $value === '') return null;
+        if (preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?/', $value, $m)) {
+            return sprintf('%02d:%02d:%02d', (int)$m[1], (int)$m[2], (int)($m[3] ?? 0));
+        }
+        return null;
+    }
+
+    /**
+     * Return the shortcut of a shift struct or plain string.
+     */
+    private static function shortcutOf($shift): string {
+        return is_array($shift) ? (string)($shift['shortcut'] ?? '') : (string)$shift;
+    }
+
+    /**
+     * Compare two shift arrays (order-insensitive), taking split metadata into
+     * account only when the expected (local) side declares a split. This keeps
+     * the push from stripping a split that exists in LOGA but is not yet known
+     * locally, while still pushing splits configured locally.
      */
     private function shiftsMatch(array $expected, array $current): bool {
-        $e = $expected;
-        $c = $current;
-        sort($e);
-        sort($c);
-        return $e === $c;
+        if (count($expected) !== count($current)) {
+            return false;
+        }
+
+        $currentByShortcut = [];
+        foreach ($current as $shift) {
+            $currentByShortcut[self::shortcutOf($shift)][] = $shift;
+        }
+
+        foreach ($expected as $exp) {
+            $shortcut = self::shortcutOf($exp);
+            if (empty($currentByShortcut[$shortcut])) {
+                return false;
+            }
+
+            $matched = false;
+            foreach ($currentByShortcut[$shortcut] as $index => $cur) {
+                if ($this->splitSatisfied($exp, $cur)) {
+                    unset($currentByShortcut[$shortcut][$index]);
+                    $matched = true;
+                    break;
+                }
+            }
+            if (!$matched) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Whether the current LOGA shift satisfies the split requirement of the
+     * expected local shift. No declared split → always satisfied.
+     */
+    private function splitSatisfied($expected, $current): bool {
+        $expectedSplit = is_array($expected) ? ($expected['splitId'] ?? null) : null;
+        if ($expectedSplit === null || $expectedSplit === '') {
+            return true;
+        }
+        if (!is_array($current)) {
+            return false;
+        }
+
+        return ($current['splitId'] ?? null) === $expectedSplit
+            && (int)($current['order'] ?? -1) === (int)($expected['order'] ?? -1);
     }
 
     // ─── LOGA API Communication ─────────────────────────────────────────────
@@ -504,17 +617,20 @@ class LogaShiftPusher {
         $shiftToPlanParams = [];
 
         foreach ($changes as $change) {
+            $currentLabels  = implode(',', array_map([__CLASS__, 'shortcutOf'], $change['currentShifts']));
+            $expectedLabels = implode(',', array_map([__CLASS__, 'shortcutOf'], $change['expectedShifts']));
             $this->logger->info(
                 "Batch {$batchNum}/{$totalBatches}: {$change['pnr']} on {$change['date']}: "
-                . implode(',', $change['currentShifts']) . " → " . implode(',', $change['expectedShifts']),
+                . $currentLabels . " → " . $expectedLabels,
                 'ShiftPusher'
             );
 
             // Prepare shifts for deletion
             $shiftsForDelete = [];
-            foreach ($change['toDelete'] as $shortcut) {
+            foreach ($change['toDelete'] as $shift) {
+                $shortcut = self::shortcutOf($shift);
                 if (isset($this->shiftIdMap[$shortcut])) {
-                    $shiftsForDelete[] = $this->buildShiftParam($this->shiftIdMap[$shortcut]);
+                    $shiftsForDelete[] = $this->buildShiftParam($this->shiftIdMap[$shortcut], is_array($shift) ? $shift : null);
                 } else {
                     $this->logger->error("Shift mapping not found for deletion: {$shortcut}", 'ShiftPusher');
                 }
@@ -522,9 +638,10 @@ class LogaShiftPusher {
 
             // Prepare shifts for addition
             $shiftsForAdd = [];
-            foreach ($change['toAdd'] as $shortcut) {
+            foreach ($change['toAdd'] as $shift) {
+                $shortcut = self::shortcutOf($shift);
                 if (isset($this->shiftIdMap[$shortcut])) {
-                    $shiftsForAdd[] = $this->buildShiftParam($this->shiftIdMap[$shortcut]);
+                    $shiftsForAdd[] = $this->buildShiftParam($this->shiftIdMap[$shortcut], is_array($shift) ? $shift : null);
                 } else {
                     $this->logger->error("Shift mapping not found for addition: {$shortcut}", 'ShiftPusher');
                 }
@@ -559,14 +676,16 @@ class LogaShiftPusher {
 
     /**
      * Build a shift parameter object for the planshifts API.
+     * When $shift carries split metadata (Dienstsplit) the split linkage and
+     * order are forwarded so LOGA keeps the duty split between the persons.
      */
-    private function buildShiftParam(string $originalId): array {
+    private function buildShiftParam(string $originalId, ?array $shift = null): array {
         return [
             'id'               => $originalId,
-            'timeFrom'         => null,
-            'timeTo'           => null,
-            'splitShift_id'    => null,
-            'order'            => null,
+            'timeFrom'         => $shift['timeFrom'] ?? null,
+            'timeTo'           => $shift['timeTo'] ?? null,
+            'splitShift_id'    => $shift['splitId'] ?? null,
+            'order'            => $shift['order'] ?? null,
             'dienstgruppeId'   => null,
         ];
     }

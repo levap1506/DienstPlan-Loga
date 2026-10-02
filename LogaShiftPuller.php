@@ -61,15 +61,16 @@ class LogaShiftPuller {
             $dateShifts = $this->groupShiftsByDate($person['dates'], $shiftToCellvalue);
 
             foreach ($dateShifts as $date => $shiftInfo) {
-                $logaCellId = $shiftInfo['cellvalueid'];
-                $localValid = $this->getLocalPlanEntry($date, $uid);
+                $logaCellId = (int)$shiftInfo['cellvalueid'];
+                $localRow = $this->getLocalPlanRow($date, $uid);
+                $localValid = $localRow !== null ? (int)$localRow['valid'] : null;
 
-                if ($localValid !== null && (int)$localValid === $logaCellId) {
+                if ($localValid !== null && $localValid === $logaCellId && $this->splitMetaMatches($localRow, $shiftInfo)) {
                     $matchCount++;
                     continue;
                 }
 
-                $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[(int)$localValid] ?? '-') : '-';
+                $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[$localValid] ?? '-') : '-';
                 $cloudAbbr = $cellValueAbbrs[$logaCellId] ?? $shiftInfo['shortcut'];
 
                 $differences[] = [
@@ -81,7 +82,14 @@ class LogaShiftPuller {
                     'localShift'  => $localAbbr,
                     'localCellId' => $localValid,
                     'key'         => $uid . '|' . $date,
-                    'action'      => ($localValid !== null) ? 'update' : 'insert',
+                    'action'      => ($localValid !== null && $localValid === $logaCellId)
+                                        ? 'split-update'
+                                        : (($localValid !== null) ? 'update' : 'insert'),
+                    'splitId'     => $shiftInfo['splitId'] ?? null,
+                    'splitOrder'  => $shiftInfo['splitOrder'] ?? null,
+                    'timeFrom'    => $shiftInfo['timeFrom'] ?? null,
+                    'timeTo'      => $shiftInfo['timeTo'] ?? null,
+                    'endsNextDay' => !empty($shiftInfo['endsNextDay']),
                 ];
             }
         }
@@ -98,11 +106,12 @@ class LogaShiftPuller {
         return [
             'differences' => $differences,
             'summary'     => [
-                'total'      => count($differences),
-                'matches'    => $matchCount,
-                'inserts'    => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'insert')),
-                'updates'    => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'update')),
-                'deletions'  => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'delete')),
+                'total'        => count($differences),
+                'matches'      => $matchCount,
+                'inserts'      => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'insert')),
+                'updates'      => count(array_filter($differences, fn($d) => in_array(($d['action'] ?? ''), ['update', 'split-update'], true))),
+                'splitUpdates' => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'split-update')),
+                'deletions'    => count(array_filter($differences, fn($d) => ($d['action'] ?? '') === 'delete')),
             ],
         ];
     }
@@ -164,7 +173,12 @@ class LogaShiftPuller {
             $exclusiveOwners = $this->loadExclusiveOwnership($exclusiveIds, $dateFrom, $dateTo);
         }
 
-        // ── Phase 2: Inserts / Updates ───────────────────────────────────────
+        // ── Phase 2: Inserts / Updates / Split metadata ──────────────────────
+        // Build the work list first and process value-matching rows before
+        // conflicts/inserts. This guarantees that an existing split owner is
+        // updated with its split_id before a co-owner is inserted on the same
+        // date, so the exclusive-cellvalue guard can recognise the shared split.
+        $work = [];
         foreach ($personsShifts as $person) {
             $uid = $pnrToUid[$person['pnr']] ?? null;
             if (!$uid) continue;
@@ -173,72 +187,112 @@ class LogaShiftPuller {
             $dateShifts = $this->groupShiftsByDate($person['dates'], $shiftToCellvalue);
 
             foreach ($dateShifts as $date => $shiftInfo) {
-                $logaCellId = $shiftInfo['cellvalueid'];
-                $localValid = $this->getLocalPlanEntry($date, $uid);
+                $localRow = $this->getLocalPlanRow($date, $uid);
+                $valueMatches = ($localRow !== null && (int)$localRow['valid'] === (int)$shiftInfo['cellvalueid']);
+                $work[] = [
+                    'uid'          => $uid,
+                    'userName'     => $userName,
+                    'date'         => $date,
+                    'shiftInfo'    => $shiftInfo,
+                    'localRow'     => $localRow,
+                    'valueMatches' => $valueMatches,
+                    'metaMatches'  => $valueMatches && $this->splitMetaMatches($localRow, $shiftInfo),
+                ];
+            }
+        }
+        // Stable sort (PHP 8): rows whose value already matches first.
+        usort($work, fn($a, $b) => ($b['valueMatches'] ? 1 : 0) <=> ($a['valueMatches'] ? 1 : 0));
 
-                // Already matching
-                if ($localValid !== null && (int)$localValid === $logaCellId) {
-                    $counts['skipped']++;
-                    continue;
-                }
+        foreach ($work as $item) {
+            $uid          = $item['uid'];
+            $userName     = $item['userName'];
+            $date         = $item['date'];
+            $shiftInfo    = $item['shiftInfo'];
+            $localRow     = $item['localRow'];
+            $logaCellId   = (int)$shiftInfo['cellvalueid'];
+            $localValid   = $localRow !== null ? (int)$localRow['valid'] : null;
 
-                $key = $uid . '|' . $date;
-                $isConflict = ($localValid !== null);
+            // Already fully matching (value + split metadata)
+            if ($item['metaMatches']) {
+                $counts['skipped']++;
+                continue;
+            }
 
-                // Resolve conflict based on strategy
-                if ($isConflict) {
-                    $action = $this->resolveConflict($strategy, $key, $resolutions);
-                    if ($action === 'keep-local') {
-                        $counts['keptLocal']++;
-                        $localAbbr = $cellValueAbbrs[(int)$localValid] ?? '-';
-                        $this->logger->info("Keeping local shift '{$localAbbr}' for {$userName} on {$date}", 'ShiftPuller');
-                        continue;
-                    }
-                    if ($action === 'skip') {
-                        $counts['skipped']++;
-                        continue;
-                    }
-                    // action === 'keep-remote' → fall through to apply
-                }
+            $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[$localValid] ?? '-') : '-';
+            $cloudAbbr = $cellValueAbbrs[$logaCellId] ?? $shiftInfo['shortcut'];
+            $key = $uid . '|' . $date;
 
-                // Apply LOGA value
-                $localAbbr = ($localValid !== null) ? ($cellValueAbbrs[(int)$localValid] ?? '-') : '-';
-                $cloudAbbr = $cellValueAbbrs[$logaCellId] ?? $shiftInfo['shortcut'];
-
-                // ── Exclusive-cellvalue guard ────────────────────────────────
-                if (in_array($logaCellId, $exclusiveIds, true)) {
-                    $ownerKey = $logaCellId . '|' . $date;
-                    $currentOwner = $exclusiveOwners[$ownerKey] ?? null;
-                    if ($currentOwner !== null && $currentOwner !== $uid) {
-                        $ownerName = $uidToName[$currentOwner] ?? "UID {$currentOwner}";
-                        $this->logger->error(
-                            "BLOCKED exclusive shift '{$cloudAbbr}' for {$userName} on {$date}: "
-                            . "already held by {$ownerName} — rule cannot be overridden",
-                            'ShiftPuller'
-                        );
-                        $counts['skipped']++;
-                        continue;
-                    }
-                }
-                // ─────────────────────────────────────────────────────────────
-
-                $result = $this->applyPlanEntry($uid, $date, $logaCellId, $isApiCall);
+            // Value unchanged, only split metadata differs → update in place.
+            if ($item['valueMatches']) {
+                $result = $this->applyPlanEntry($uid, $date, $logaCellId, $isApiCall, $shiftInfo);
                 if ($result) {
-                    $op = strtoupper($result['operation'] ?? '');
-                    if ($op === 'INSERT') $counts['inserted']++;
-                    elseif ($op === 'UPDATE') $counts['updated']++;
-                    else $counts['skipped']++;
-
-                    $actionLabel = ($op === 'INSERT') ? 'Inserted' : 'Updated';
-                    $this->logger->info("{$actionLabel} shift: {$userName} on {$date} - '{$localAbbr}' → '{$cloudAbbr}'", 'ShiftPuller');
-
-                    // Update in-run ownership so subsequent writes in this batch are also blocked
+                    $counts['updated']++;
+                    $this->logger->info("Updated split metadata: {$userName} on {$date} - '{$cloudAbbr}'", 'ShiftPuller');
                     if (in_array($logaCellId, $exclusiveIds, true)) {
-                        $exclusiveOwners[$logaCellId . '|' . $date] = $uid;
+                        $exclusiveOwners[$logaCellId . '|' . $date] = ['uid' => $uid, 'splitId' => $shiftInfo['splitId'] ?? null];
                     }
                 } else {
                     $counts['errors']++;
                 }
+                continue;
+            }
+
+            $isConflict = ($localValid !== null);
+
+            // Resolve conflict based on strategy
+            if ($isConflict) {
+                $action = $this->resolveConflict($strategy, $key, $resolutions);
+                if ($action === 'keep-local') {
+                    $counts['keptLocal']++;
+                    $this->logger->info("Keeping local shift '{$localAbbr}' for {$userName} on {$date}", 'ShiftPuller');
+                    continue;
+                }
+                if ($action === 'skip') {
+                    $counts['skipped']++;
+                    continue;
+                }
+                // action === 'keep-remote' → fall through to apply
+            }
+
+            // ── Exclusive-cellvalue guard ────────────────────────────────
+            // A duty may legitimately be covered by several persons when they are
+            // parts of the same split (identical split_id).
+            if (in_array($logaCellId, $exclusiveIds, true)) {
+                $ownerKey = $logaCellId . '|' . $date;
+                $owner = $exclusiveOwners[$ownerKey] ?? null;
+                $sameSplit = $owner !== null
+                    && !empty($shiftInfo['splitId'])
+                    && !empty($owner['splitId'])
+                    && $owner['splitId'] === $shiftInfo['splitId'];
+                if ($owner !== null && (int)$owner['uid'] !== $uid && !$sameSplit) {
+                    $ownerName = $uidToName[(int)$owner['uid']] ?? "UID {$owner['uid']}";
+                    $this->logger->error(
+                        "BLOCKED exclusive shift '{$cloudAbbr}' for {$userName} on {$date}: "
+                        . "already held by {$ownerName} — rule cannot be overridden",
+                        'ShiftPuller'
+                    );
+                    $counts['skipped']++;
+                    continue;
+                }
+            }
+            // ─────────────────────────────────────────────────────────────
+
+            $result = $this->applyPlanEntry($uid, $date, $logaCellId, $isApiCall, $shiftInfo);
+            if ($result) {
+                $op = strtoupper($result['operation'] ?? '');
+                if ($op === 'INSERT') $counts['inserted']++;
+                elseif ($op === 'UPDATE') $counts['updated']++;
+                else $counts['skipped']++;
+
+                $actionLabel = ($op === 'INSERT') ? 'Inserted' : 'Updated';
+                $this->logger->info("{$actionLabel} shift: {$userName} on {$date} - '{$localAbbr}' → '{$cloudAbbr}'", 'ShiftPuller');
+
+                // Update in-run ownership so subsequent writes in this batch are also blocked
+                if (in_array($logaCellId, $exclusiveIds, true)) {
+                    $exclusiveOwners[$logaCellId . '|' . $date] = ['uid' => $uid, 'splitId' => $shiftInfo['splitId'] ?? null];
+                }
+            } else {
+                $counts['errors']++;
             }
         }
 
@@ -256,43 +310,105 @@ class LogaShiftPuller {
 
     /**
      * Group shifts by date, taking the first mapped cellvalue per date.
+     * Split metadata (Dienstsplit) of the chosen shift is preserved. If a later
+     * shift on the same day carries split data and the stored one does not, the
+     * split-annotated shift wins.
      */
     private function groupShiftsByDate(array $dates, array $shiftToCellvalue): array {
         $dateShifts = [];
         foreach ($dates as $entry) {
             $shiftId = $entry['id'];
-            if (isset($shiftToCellvalue[$shiftId])) {
-                $date = $entry['date'];
-                if (!isset($dateShifts[$date])) {
-                    $dateShifts[$date] = [
-                        'cellvalueid' => $shiftToCellvalue[$shiftId]['cellvalueid'],
-                        'shortcut'    => $shiftToCellvalue[$shiftId]['shortcut'],
-                    ];
-                }
+            if (!isset($shiftToCellvalue[$shiftId])) {
+                continue;
+            }
+            $date = $entry['date'];
+            $candidate = [
+                'cellvalueid' => $shiftToCellvalue[$shiftId]['cellvalueid'],
+                'shortcut'    => $shiftToCellvalue[$shiftId]['shortcut'],
+                'splitId'     => $entry['splitId'] ?? null,
+                'splitOrder'  => $entry['splitOrder'] ?? null,
+                'timeFrom'    => $entry['timeFrom'] ?? null,
+                'timeTo'      => $entry['timeTo'] ?? null,
+                'endsNextDay' => !empty($entry['endsNextDay']) ? 1 : 0,
+            ];
+
+            if (!isset($dateShifts[$date])) {
+                $dateShifts[$date] = $candidate;
+            } elseif (!empty($candidate['splitId']) && empty($dateShifts[$date]['splitId'])) {
+                $dateShifts[$date] = $candidate;
             }
         }
         return $dateShifts;
     }
 
     /**
-     * Get the local plan entry for a given date + uid.
+     * Get the local plan row for a given date + uid, including split metadata.
      */
-    private function getLocalPlanEntry(string $date, int $uid): ?int {
-        $stmt = $this->conn->prepare("SELECT valid FROM plan WHERE datum = ? AND uid = ?");
+    private function getLocalPlanRow(string $date, int $uid): ?array {
+        $stmt = $this->conn->prepare(
+            "SELECT valid, split_id, split_order, time_from, time_to, ends_next_day "
+            . "FROM plan WHERE datum = ? AND uid = ? LIMIT 1"
+        );
         $stmt->bind_param("si", $date, $uid);
         $stmt->execute();
         $stmt->store_result();
 
-        $valid = null;
+        $row = null;
         if ($stmt->num_rows > 0) {
-            $stmt->bind_result($valid);
+            $valid = null;
+            $splitId = null;
+            $splitOrder = null;
+            $timeFrom = null;
+            $timeTo = null;
+            $endsNextDay = 0;
+            $stmt->bind_result($valid, $splitId, $splitOrder, $timeFrom, $timeTo, $endsNextDay);
             $stmt->fetch();
+            $row = [
+                'valid'         => (int)$valid,
+                'split_id'      => $splitId,
+                'split_order'   => $splitOrder !== null ? (int)$splitOrder : null,
+                'time_from'     => $timeFrom,
+                'time_to'       => $timeTo,
+                'ends_next_day' => (int)$endsNextDay,
+            ];
         }
 
         $stmt->free_result();
         $stmt->close();
 
-        return $valid !== null ? (int)$valid : null;
+        return $row;
+    }
+
+    /**
+     * Compare the split metadata of a local plan row with an incoming LOGA shift.
+     */
+    private function splitMetaMatches(?array $localRow, array $shiftInfo): bool {
+        if ($localRow === null) {
+            return false;
+        }
+
+        $localSplit = $localRow['split_id'] ?? null;
+        $incoming   = $shiftInfo['splitId'] ?? null;
+        if ((string)($localSplit ?? '') !== (string)($incoming ?? '')) {
+            return false;
+        }
+
+        $localOrder    = $localRow['split_order'] !== null ? (int)$localRow['split_order'] : null;
+        $incomingOrder = ($shiftInfo['splitOrder'] ?? null) !== null ? (int)$shiftInfo['splitOrder'] : null;
+        if ($localOrder !== $incomingOrder) {
+            return false;
+        }
+
+        if (LogaProcessor::normalizeTime($localRow['time_from'] ?? null) !== ($shiftInfo['timeFrom'] ?? null)) {
+            return false;
+        }
+        if (LogaProcessor::normalizeTime($localRow['time_to'] ?? null) !== ($shiftInfo['timeTo'] ?? null)) {
+            return false;
+        }
+
+        $localEnds    = !empty($localRow['ends_next_day']) ? 1 : 0;
+        $incomingEnds = !empty($shiftInfo['endsNextDay']) ? 1 : 0;
+        return $localEnds === $incomingEnds;
     }
 
     /**
@@ -435,14 +551,14 @@ class LogaShiftPuller {
 
     /**
      * Pre-load current exclusive-cellvalue ownership for a date range.
-     * Returns [ "cellvalueid|date" => uid ]
+     * Returns [ "cellvalueid|date" => ['uid' => int, 'splitId' => ?string] ]
      */
     private function loadExclusiveOwnership(array $exclusiveIds, string $dateFrom, string $dateTo): array {
         if (empty($exclusiveIds)) return [];
 
         $placeholders = implode(',', array_fill(0, count($exclusiveIds), '?'));
         $stmt = $this->conn->prepare(
-            "SELECT uid, datum, valid FROM plan "
+            "SELECT uid, datum, valid, split_id FROM plan "
             . "WHERE datum BETWEEN ? AND ? AND valid IN ({$placeholders})"
         );
         $types = 'ss' . str_repeat('i', count($exclusiveIds));
@@ -453,7 +569,10 @@ class LogaShiftPuller {
         $map = [];
         while ($row = $result->fetch_assoc()) {
             $key = (int)$row['valid'] . '|' . $row['datum'];
-            $map[$key] = (int)$row['uid'];
+            $map[$key] = [
+                'uid'     => (int)$row['uid'],
+                'splitId' => $row['split_id'] ?? null,
+            ];
         }
         $stmt->close();
         return $map;
@@ -462,12 +581,17 @@ class LogaShiftPuller {
     /**
      * Apply a single plan entry via internal API.
      */
-    private function applyPlanEntry(int $uid, string $date, int $cellValueId, bool $isApiCall): ?array {
+    private function applyPlanEntry(int $uid, string $date, int $cellValueId, bool $isApiCall, array $shiftInfo = []): ?array {
         try {
             return $this->processor->callInternalApi('update_calendar', [
                 'optionData'   => $cellValueId,
                 'targetDatum'  => $date,
                 'targetPerson' => $uid,
+                'splitId'      => $shiftInfo['splitId'] ?? null,
+                'splitOrder'   => $shiftInfo['splitOrder'] ?? null,
+                'timeFrom'     => $shiftInfo['timeFrom'] ?? null,
+                'timeTo'       => $shiftInfo['timeTo'] ?? null,
+                'endsNextDay'  => !empty($shiftInfo['endsNextDay']) ? 1 : 0,
             ], $isApiCall);
         } catch (\Exception $e) {
             $this->logger->error("Failed to apply plan entry for UID {$uid} on {$date}: " . $e->getMessage(), 'ShiftPuller');

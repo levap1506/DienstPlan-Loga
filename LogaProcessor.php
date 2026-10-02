@@ -299,9 +299,22 @@ class LogaProcessor {
                 if (!isset($day['shifts']) || !is_array($day['shifts'])) continue;
                 foreach ($day['shifts'] as $shift) {
                     $origId = $shift['id'] ?? null;
-                    if ($origId !== null && isset($shiftMap[$origId])) {
-                        $dates[] = ['date' => $date, 'id' => $shiftMap[$origId]];
-                    }
+                    if ($origId === null || !isset($shiftMap[$origId])) continue;
+
+                    // Dienstsplit: several persons share one duty on the same day.
+                    // LOGA annotates each part with a shiftSplitData block.
+                    $split    = is_array($shift['shiftSplitData'] ?? null) ? $shift['shiftSplitData'] : null;
+                    $interval = is_array($shift['timeInterval'] ?? null) ? $shift['timeInterval'] : null;
+
+                    $dates[] = [
+                        'date'        => $date,
+                        'id'          => $shiftMap[$origId],
+                        'splitId'     => $split['splitShift_id'] ?? null,
+                        'splitOrder'  => isset($split['order']) ? (int)$split['order'] : null,
+                        'timeFrom'    => self::normalizeTime($interval['timeFrom'] ?? null),
+                        'timeTo'      => self::normalizeTime($interval['timeTo'] ?? null),
+                        'endsNextDay' => !empty($interval['endsNextDay']),
+                    ];
                 }
             }
 
@@ -316,6 +329,17 @@ class LogaProcessor {
 
         $this->logger->info("Processed shift assignments for " . count($personsShifts) . " persons", 'LogaProcessor');
         return $personsShifts;
+    }
+
+    /**
+     * Normalize a LOGA time value ("08:30:00.000") into DB TIME format ("08:30:00").
+     */
+    public static function normalizeTime(?string $value): ?string {
+        if ($value === null || $value === '') return null;
+        if (preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?/', $value, $m)) {
+            return sprintf('%02d:%02d:%02d', (int)$m[1], (int)$m[2], (int)($m[3] ?? 0));
+        }
+        return null;
     }
 
     // ─── Persons Absences ───────────────────────────────────────────────────
@@ -532,6 +556,10 @@ class LogaProcessor {
             $_POST['optionData'] = $params['optionData'];
             $_POST['targetDatum'] = $params['targetDatum'];
             $_POST['targetPerson'] = $params['targetPerson'];
+            // Split (Dienstsplit) metadata — optional
+            foreach (['splitId', 'splitOrder', 'timeFrom', 'timeTo', 'endsNextDay'] as $splitKey) {
+                $_POST[$splitKey] = $params[$splitKey] ?? null;
+            }
 
             ob_start();
             handleUpdateCalendar();
