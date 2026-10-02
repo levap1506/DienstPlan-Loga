@@ -278,6 +278,16 @@ identitatea `SBKSBK30174841` și constanta `L3SDCHOMF8U`; data țintă apare ca
 `2026-10-02T…`. Trimiterea salvează evenimentele zilei, deci pentru o zi nouă
 GUID-urile trebuie generate de client, iar orele/datele templatate.
 
+**Diff între două trimiteri (2026-10-03):** payload-ul `submitEventData` NU
+conține doar intrarea nouă, ci **întregul set de evenimente al zilei** (blocul
+normal de lucru + perechile `Kommen`/`Gehen`), fiecare eveniment cu GUID propriu.
+La adăugarea unui eveniment crește tabelul de string-uri (84 → 93) și apar
+GUID-uri noi (ex. `9A95796B-…`, `51ADB605-…`) plus ora nouă
+(`2026-10-03T22:30:00.000`). De aceea un șablon fix este nesigur: ar rescrie și
+blocul normal (care trebuie păstrat). Pentru push e nevoie de: citirea zilei,
+înlocuirea doar a perechii `Kommen`/`Gehen` (GUID-uri noi) și retrimiterea
+întregului set — adică reconstrucția modelului de evenimente al măștii.
+
 **De făcut:** de stabilit câmpurile variabile (dată, oră început/sfârșit, tip)
 pentru a templata payload-ul și a-l trimite din client (comanda `request`).
 
