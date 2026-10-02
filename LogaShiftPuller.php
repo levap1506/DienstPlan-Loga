@@ -389,6 +389,13 @@ class LogaShiftPuller {
 
         $localSplit = $localRow['split_id'] ?? null;
         $incoming   = $shiftInfo['splitId'] ?? null;
+
+        // Neither side is a split: equality of the value is enough. Times are
+        // not tracked for regular duties, so do not treat them as a difference.
+        if (($localSplit === null || $localSplit === '') && ($incoming === null || $incoming === '')) {
+            return true;
+        }
+
         if ((string)($localSplit ?? '') !== (string)($incoming ?? '')) {
             return false;
         }
