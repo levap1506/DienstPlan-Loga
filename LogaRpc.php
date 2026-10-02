@@ -76,9 +76,10 @@ class LogaRpc {
     public static function headers(string $moduleBase, string $permutation, string $token, string $mask = 'LWSPEP'): array {
         return [
             'Origin: https://schwarzw.pi-asp.de',
+            'Referer: https://schwarzw.pi-asp.de/loga3/private/layout?action=afterlogin',
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0',
             'Accept: */*',
-            'Content-Type: text/x-gwt-rpc; charset=utf-8',
+            'Content-Type: text/x-gwt-rpc; charset=UTF-8',
             'Rpc-Xsrf: ' . $token,
             'X-GWT-Module-Base: ' . $moduleBase,
             'X-GWT-Permutation: ' . $permutation,
