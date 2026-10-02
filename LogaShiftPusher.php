@@ -561,8 +561,17 @@ class LogaShiftPusher {
             return false;
         }
 
-        return ($current['splitId'] ?? null) === $expectedSplit
-            && (int)($current['order'] ?? -1) === (int)($expected['order'] ?? -1);
+        $currentSplit = $current['splitId'] ?? null;
+        if ($currentSplit === null || $currentSplit === '') {
+            // LOGA has no split here yet → it has to be created.
+            return false;
+        }
+
+        // Both sides are split parts. LOGA assigns its own splitShift_id, so a
+        // locally created split legitimately carries a different id; treat the
+        // parts as equal when their order matches instead of rewriting LOGA's
+        // split. The authoritative id is adopted by the next pull.
+        return (int)($current['order'] ?? -1) === (int)($expected['order'] ?? -1);
     }
 
     // ─── LOGA API Communication ─────────────────────────────────────────────
