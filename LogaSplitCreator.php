@@ -6,6 +6,12 @@
  * (MaskActionSrv.callMaskAction), using the captured envelope template
  * LOGA_SPLIT_ACTION_TEMPLATE and substituting persons/date/shift.
  *
+ * NOTE (finding 2026-10-02): the transport works, but the portal answers
+ * HTTP 500 for Mask calls from a bot session because the PEP application
+ * context (open mask) is not established. Reusing the browser's static mask
+ * ids/headers is not enough. Keep splits pull-only unless the full PEP
+ * bootstrap is reproduced (see client/FINDINGS.md).
+ *
  * @author  DienstPlan System
  */
 

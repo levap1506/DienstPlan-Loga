@@ -114,6 +114,49 @@ Astfel, un corp capturat poate fi **decriptat**, șablonat (token/lună/ID) și
 auto-test cu un vector fix care verifică atât decriptarea, cât și faptul că
 `encrypt(decrypt(x))` reproduce exact corpul original.
 
+## Mask/privateRPC — crearea unui Dienstsplit (finding, 2026-10-02)
+
+Obiectiv: crearea unui split (alocare împărțită între doi angajați) direct din
+bot, prin `MaskActionSrv.callMaskAction`, în loc de UI.
+
+**Ce funcționează**
+- Transportul criptat (mai sus) este corect: apelurile nemaskate reușesc din
+  sesiunea botului, ex. `commonGwtService.shouldRefreshTerminal` →
+  `//OK[0,1,["8kc"],3,7]`, `navigation.loadClientInitData` → `//OK[...]`,
+  `commonGwtService.loga3OpenParams` → `//OK[...]`.
+- Headerele necesare: `Content-Type: text/x-gwt-rpc; charset=UTF-8`,
+  `Referer: .../private/layout?action=afterlogin`, `Rpc-Xsrf`,
+  `X-GWT-Module-Base: .../<build>/L2Main/`, `X-GWT-Permutation`,
+  `rpc-context-app: LOGA`, `rpc-context-msk: LWSPEP`.
+
+**Metode Mask observate (build `20260813015921482`):** `MaskActionSrv.callMaskAction`;
+`MaskDataGwtService.getMaskConfig`, `getToolbarLabelData`,
+`getSplitScreenEnableDisableOption`, `readSingleDataWithOptions`,
+`getTableViewFilteringUserDefaultValues`, `writeProtUserLog`;
+`ServerDataGwtService.saveContext`, `notifyContextChange`, `getLogaMessages`,
+`getAkAbstand`, `loadCorporateStyleMap`.
+
+**Blocajul:** identificatorii de mask `4c060823-0fdb-43b0-b988-7377c71f3f49`
+și `y2em5e3qC1fcZrCggryW` sunt **constante** (identici între logări), deci nu
+sunt generați per sesiune. Cu toate acestea, din sesiunea botului toate
+apelurile Mask (`getToolbarLabelData`, `getMaskConfig`, `saveContext`,
+`notifyContextChange`, `callMaskAction`) răspund **HTTP 500**, deși
+envelope-ul, id-urile și headerele sunt identice cu cele din browser. Apelurile
+nemaskate din aceeași sesiune răspund 200. Prin urmare 500-ul nu ține de
+criptare/id/headere, ci de **lipsa contextului server-side al aplicației PEP**
+(masca deschisă în sesiune). Rejucarea pașilor REST de bootstrap cunoscuți
+(`spepdatachangeservice/updatetabs`) nu deblochează apelurile Mask.
+
+**Concluzie:** crearea split-ului prin RPC direct nu este fezabilă fără
+reproducerea completă a bootstrap-ului PEP (secvență lungă, dependentă de
+build). Recomandare: split-urile rămân **pull-only** în DienstPlan; dacă este
+nevoie de creare automată, calea practică este automatizarea unui browser
+(Playwright/Selenium) sau continuarea reverse-engineering-ului bootstrap-ului.
+
+**Artefacte:** `loga/LogaRpc.php`, `LogaClient::privateRpc()`,
+`loga/LogaSplitCreator.php` (transport funcțional, creare blocată),
+`loga/client/loga_rpc.py` (+ self-test).
+
 ## Date locale și protecție
 
 ```text
