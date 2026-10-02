@@ -260,6 +260,27 @@ după `openMask` + `loadFilesForScreen`) răspunde **500**. Clientul poate deci
 lista fișierele și numele lor reale, dar descărcarea PDF necesită încă un pas
 (maparea fileId → document-id), care trebuie capturat.
 
+## Cerere „Erfassung Rufbereitschaft Einsatz" (finding, 2026-10-03)
+
+SmartThing-ul „Erfassung Rufbereitschaft Einsatz" (Smart ID `L3SDCHOMF8U`,
+descriere „SD zur Zeiterfassung NUR für Einsatzzeiten in der Rufbereitschaft")
+se trimite prin masca Zeitdaten:
+
+```text
+POST privateRPC/maskActionService   LZWZEITD_<i>$timeAttendanceServerMaskPart$loadMaskPartData   (deschide formularul)
+POST privateRPC/maskActionService   LZWZEITD_<i>$timeAttendanceServerMaskPart$submitEventData     (trimite)
+                                    → //OK[0,1,["310"],3,7]
+```
+
+Envelope-ul `submitEventData` (84 de elemente) conține **setul complet de
+evenimente al zilei** (GUID-uri + ore + simboluri `KO`/`GE`/`TA`/`TE`/…),
+identitatea `SBKSBK30174841` și constanta `L3SDCHOMF8U`; data țintă apare ca
+`2026-10-02T…`. Trimiterea salvează evenimentele zilei, deci pentru o zi nouă
+GUID-urile trebuie generate de client, iar orele/datele templatate.
+
+**De făcut:** de stabilit câmpurile variabile (dată, oră început/sfârșit, tip)
+pentru a templata payload-ul și a-l trimite din client (comanda `request`).
+
 ## Date locale și protecție
 
 ```text
