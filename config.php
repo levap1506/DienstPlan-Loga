@@ -80,6 +80,30 @@ if (!defined('LOGA_PROTECTED_SHIFTS')) {
     define('LOGA_PROTECTED_SHIFTS', ['AT']);
 }
 
+// ── Mask bootstrap (required before ANY Mask privateRPC) ───────────────────
+// The PEP mask must be "opened" in the server session first, otherwise every
+// MaskDataGwtService/MaskActionSrv call answers HTTP 500. This is the first
+// callMaskAction the browser issues when the mask opens (captured 2026-10-03).
+if (!defined('LOGA_MASK_OPEN_ACTION')) {
+    define('LOGA_MASK_OPEN_ACTION',
+        '7|3|19|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'
+        . '3jw|2vm|com.piag.lweb.ui.masks.shared.actions.Action|4k9|3k0|37f|4c060823-0fdb-43b0-b988-7377c71f3f49|'
+        . '8lz|4vl|y2em5e3qC1fcZrCggryW|LWSPEP|8mb|5q4|1|2|3|4|5|6|4|7|8|9|10|7|0|11|0|12|LTW|12|LT0|'
+        . '0|0|0|13|14|0|15|16|0|0|0|17|0|0|0|0|0|0|0|0|0|0|8|18|0|19|8|0|'
+    );
+}
+
+// Load a month into the open mask (captured alongside the split on 2026-10-03).
+if (!defined('LOGA_MASK_MONTH_ACTION')) {
+    define('LOGA_MASK_MONTH_ACTION',
+        '7|3|28|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'
+        . '3jw|2vm|com.piag.lweb.ui.masks.shared.actions.Action|4k9|*|3k0|37f|SBK|'
+        . '4c060823-0fdb-43b0-b988-7377c71f3f49|8lz|4vl|y2em5e3qC1fcZrCggryW|LWSPEP|'
+        . '8mb|5q4|5jw|5w1|000|8m7|{FROM_DT}|{TO_DT}|8ke|1|2|3|4|5|6|4|7|8|9|10|7|11|12|0|13|LTW|13|LT0|'
+        . '0|0|14|15|16|0|17|18|0|0|0|19|0|0|0|0|0|0|0|0|0|0|8|20|0|21|24|10|1|22|1|23|0|24|25|26|25|27|0|28|0|14|'
+    );
+}
+
 // ── Split creation via privateRPC ──────────────────────────────────────────
 // Captured MaskActionSrv.callMaskAction envelope that creates a Dienstsplit
 // (primary + partner). Placeholders are filled by LogaRpc::fill().

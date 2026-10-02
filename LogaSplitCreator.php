@@ -6,11 +6,11 @@
  * (MaskActionSrv.callMaskAction), using the captured envelope template
  * LOGA_SPLIT_ACTION_TEMPLATE and substituting persons/date/shift.
  *
- * NOTE (finding 2026-10-02): the transport works, but the portal answers
- * HTTP 500 for Mask calls from a bot session because the PEP application
- * context (open mask) is not established. Reusing the browser's static mask
- * ids/headers is not enough. Keep splits pull-only unless the full PEP
- * bootstrap is reproduced (see client/FINDINGS.md).
+ * FIXED (finding 2026-10-03): the portal answers HTTP 500 for Mask calls
+ * until the PEP mask has been opened in the server session. Sending the
+ * mask-open action (LOGA_MASK_OPEN_ACTION) followed by a month load
+ * (LOGA_MASK_MONTH_ACTION) establishes the context; afterwards all Mask
+ * calls return 200. The bootstrap is now performed automatically.
  *
  * @author  DienstPlan System
  */
@@ -58,6 +58,9 @@ class LogaSplitCreator {
         $version    = $this->runtimeConfig['logaVersion'] ?? '';
         $moduleBase = LOGA_BASE_URL . "bts/{$version}/L2Main/";
 
+        // Establish the PEP mask context — without this every Mask call is HTTP 500.
+        $this->bootstrapMask($moduleBase, $token, $date);
+
         $envelope = LogaRpc::fill(LOGA_SPLIT_ACTION_TEMPLATE, [
             'MODULE_BASE'     => $moduleBase,
             'TOKEN'           => $token,
@@ -90,5 +93,42 @@ class LogaSplitCreator {
         );
 
         return ['success' => true, 'response' => $response, 'decoded' => $decoded];
+    }
+
+    /**
+     * Send the mask-open action and load the target month, establishing the
+     * PEP mask context required by every subsequent Mask privateRPC.
+     */
+    public function bootstrapMask(string $moduleBase, string $token, string $date): void {
+        $open = LogaRpc::fill(LOGA_MASK_OPEN_ACTION, [
+            'MODULE_BASE' => $moduleBase,
+            'TOKEN'       => $token,
+        ]);
+        $this->sendMaskAction('OPEN', $open, $token);
+
+        $yearMonth = substr($date, 0, 7);
+        $from = $yearMonth . '-01T00:00:00.000';
+        $to   = date('Y-m-t', strtotime($yearMonth . '-01')) . 'T00:00:00.000';
+        $month = LogaRpc::fill(LOGA_MASK_MONTH_ACTION, [
+            'MODULE_BASE' => $moduleBase,
+            'TOKEN'       => $token,
+            'FROM_DT'     => $from,
+            'TO_DT'       => $to,
+        ]);
+        $this->sendMaskAction('MONTH', $month, $token);
+    }
+
+    /** Send a MaskActionSrv.callMaskAction envelope and decrypt the reply. */
+    private function sendMaskAction(string $label, string $envelope, string $token): string {
+        $this->logger->debug("Mask bootstrap {$label}: sending", 'SplitCreator');
+        $response = $this->client->privateRpc('MaskActionSrv', $envelope, $this->runtimeConfig);
+        $decoded = '';
+        try {
+            $decoded = LogaRpc::decryptBody($token, $response);
+        } catch (\Throwable $e) {
+            $decoded = '(undecryptable)';
+        }
+        $this->logger->debug("Mask bootstrap {$label} → " . substr($decoded, 0, 160), 'SplitCreator');
+        return $decoded;
     }
 }

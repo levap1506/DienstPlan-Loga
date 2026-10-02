@@ -147,14 +147,36 @@ criptare/id/headere, ci de **lipsa contextului server-side al aplicației PEP**
 (masca deschisă în sesiune). Rejucarea pașilor REST de bootstrap cunoscuți
 (`spepdatachangeservice/updatetabs`) nu deblochează apelurile Mask.
 
-**Concluzie:** crearea split-ului prin RPC direct nu este fezabilă fără
-reproducerea completă a bootstrap-ului PEP (secvență lungă, dependentă de
-build). Recomandare: split-urile rămân **pull-only** în DienstPlan; dacă este
-nevoie de creare automată, calea practică este automatizarea unui browser
-(Playwright/Selenium) sau continuarea reverse-engineering-ului bootstrap-ului.
+**Rezolvare (2026-10-03):** blocajul nu era criptarea, ci **lipsa bootstrap-ului
+măștii**. Primul `callMaskAction` pe care aplicația îl trimite la deschiderea
+măștii (envelope de 19 elemente, fără interval) **deschide masca în sesiunea
+server-side**; imediat după el, toate apelurile Mask (`getToolbarLabelData`,
+`callMaskAction`, …) răspund **200**, inclusiv din sesiunea botului. Secvența
+minimă necesară, verificată cap-coadă:
+1. `callMaskAction` — acțiunea de deschidere (`LOGA_MASK_OPEN_ACTION`);
+2. `callMaskAction` — încărcarea lunii țintă (`LOGA_MASK_MONTH_ACTION`);
+3. `callMaskAction` — acțiunea de creare split (`LOGA_SPLIT_ACTION_TEMPLATE`).
+
+Envelope-urile se completează cu `LogaRpc::fill()` + token/`moduleBase` per
+sesiune. `LogaSplitCreator::create()` execută automat pașii 1–2 înainte de 3.
+
+**Dovadă:** pentru un split real (owner `3021652`, partner `9003722`, objekt
+`VSÄDNCH`, shift `*\!ÄDNCHR09\!r2`) răspunsul botului este **identic, octet cu
+octet**, cu cel al browserului:
+`//OK[0,3,0,2,0,0,2,0,0,0,0,0,0,0,3,0,0,0,4,0,3,0,2,0,1,["3nd","8mb","8mj","8mh"],3,7]`.
+Crearea este idempotentă (re-trimiterea nu duplică split-ul).
+
+**Explorare anterioară (2026-10-02) — de ce părea imposibil:**
+- Pagina `private/layout` expune `maskToOpen`/`l3MaskIdToOpen`/`l3ParametersToOpenWith`,
+  dar ele sunt umplute de GWT (JS), nu din query params.
+- Rejucarea secvenței REST de bootstrap (`loadActualUserData`, `loadobjekts`,
+  `loadtabs`, `spepdatachangeservice/updatetabs`, `spepdataservice/*`, …) → 200,
+  dar nu stabilea contextul de mască; lipsea exact `callMaskAction` de deschidere.
+- Un POST simplu de login (fără JS/2FA) nu autentifică; sesiunea reală vine din
+  login-ul interactiv.
 
 **Artefacte:** `loga/LogaRpc.php`, `LogaClient::privateRpc()`,
-`loga/LogaSplitCreator.php` (transport funcțional, creare blocată),
+`loga/LogaSplitCreator.php` (creare funcțională: bootstrap mască + template),
 `loga/client/loga_rpc.py` (+ self-test).
 
 ## Date locale și protecție
