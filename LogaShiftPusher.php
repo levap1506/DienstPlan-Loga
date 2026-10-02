@@ -21,6 +21,8 @@ require_once __DIR__ . '/LogaLogger.php';
 require_once __DIR__ . '/LogaClient.php';
 require_once __DIR__ . '/LogaAuth.php';
 require_once __DIR__ . '/LogaProcessor.php';
+require_once __DIR__ . '/LogaRpc.php';
+require_once __DIR__ . '/LogaSplitCreator.php';
 
 class LogaShiftPusher {
     private mysqli $conn;
@@ -34,6 +36,8 @@ class LogaShiftPusher {
     private array $shiftIdMap = [];
     /** @var array<int,string> local user id => LOGA PNR */
     private array $uidToPnr = [];
+    /** Lazily created Mask-action split creator (Dienstsplit). */
+    private ?LogaSplitCreator $splitCreator = null;
 
     public function __construct(
         mysqli $conn,
@@ -117,6 +121,8 @@ class LogaShiftPusher {
 
         $this->logger->info("Preview complete: {$syncCount} users with changes, {$skipCount} no changes", 'ShiftPusher');
 
+        $splitIntents = LOGA_SPLIT_CREATE_ENABLED ? $this->collectMissingSplits($currentLogaData) : [];
+
         return [
             'changes' => $allChanges,
             'summary' => [
@@ -125,7 +131,9 @@ class LogaShiftPusher {
                 'totalChanges'     => count($allChanges),
                 'totalAdds'        => array_sum(array_map(fn($c) => count($c['toAdd']), $allChanges)),
                 'totalDeletes'     => array_sum(array_map(fn($c) => count($c['toDelete']), $allChanges)),
+                'splitsToCreate'   => count($splitIntents),
             ],
+            'splitsToCreate' => $splitIntents,
         ];
     }
 
@@ -166,6 +174,18 @@ class LogaShiftPusher {
             }
         }
 
+        // Dienstsplit: LOGA ignores the split linkage in the REST planshifts
+        // call, so a locally declared split that LOGA does not have yet is
+        // created through the Mask action. Remove its parts from the REST
+        // changes so the two do not fight.
+        $splitResult = ['handled' => [], 'created' => 0, 'skipped' => 0];
+        if (LOGA_SPLIT_CREATE_ENABLED && !empty($allChanges)) {
+            $splitResult = $this->createMissingSplits($currentLogaData);
+            if (!empty($splitResult['handled'])) {
+                $allChanges = $this->filterHandledSplitParts($allChanges, $splitResult['handled']);
+            }
+        }
+
         // Send all changes in batches
         $batchResult = ['success' => 0, 'failed' => 0];
         if (!empty($allChanges)) {
@@ -174,7 +194,8 @@ class LogaShiftPusher {
 
         $this->logger->info(
             "Shift push complete: {$syncCount} users with changes, {$skipCount} no changes, "
-            . "{$batchResult['success']} batches OK, {$batchResult['failed']} batches failed",
+            . "{$batchResult['success']} batches OK, {$batchResult['failed']} batches failed, "
+            . "{$splitResult['created']} splits created",
             'ShiftPusher'
         );
 
@@ -184,6 +205,8 @@ class LogaShiftPusher {
             'totalChanges'     => count($allChanges),
             'batchesSuccess'   => $batchResult['success'],
             'batchesFailed'    => $batchResult['failed'],
+            'splitsCreated'    => $splitResult['created'],
+            'splitsSkipped'    => $splitResult['skipped'],
             'allSuccess'       => ($batchResult['failed'] === 0),
         ];
     }
@@ -616,6 +639,210 @@ class LogaShiftPusher {
         // parts as equal when their order matches instead of rewriting LOGA's
         // split. The authoritative id is adopted by the next pull.
         return (int)($current['order'] ?? -1) === (int)($expected['order'] ?? -1);
+    }
+
+    // ─── Dienstsplit creation (Mask action) ──────────────────────────────────
+
+    /**
+     * Build the Mask-action shift id from a REST shift id ('*|ÄDNCHR09|r2' →
+     * '*\!ÄDNCHR09\!r2').
+     */
+    private static function toMaskShiftId(string $originalId): string {
+        return str_replace('|', '\\!', $originalId);
+    }
+
+    /** Whether any shift in the list uses the given shortcut. */
+    private static function hasShortcut(array $shifts, string $shortcut): bool {
+        foreach ($shifts as $shift) {
+            if (self::shortcutOf($shift) === $shortcut) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The split shift shortcut for a plan value (1→O{suffix}, 2→r/R{suffix}). */
+    private function splitShiftShortcut(int $valid, string $date): ?string {
+        $suffix = $this->getOSuffix($date);
+        return match ($valid) {
+            1 => 'O' . $suffix,
+            2 => $this->getRShiftWithSuffix($suffix),
+            default => null,
+        };
+    }
+
+    /**
+     * Local split groups (order 0 = owner, order 1 = partner) in the sync range.
+     *
+     * @return array<string,array{date:string,parts:array<int,array{uid:int,valid:int}>}>
+     */
+    private function getLocalSplitGroups(): array {
+        $stmt = $this->conn->prepare(
+            "SELECT datum, uid, split_order, valid FROM plan "
+            . "WHERE split_id IS NOT NULL AND datum BETWEEN ? AND ? AND valid IN (1, 2) "
+            . "ORDER BY split_id, split_order"
+        );
+        $stmt->bind_param("ss", $this->dateFrom, $this->dateTo);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $groups = [];
+        while ($row = $result->fetch_assoc()) {
+            $sid = (string)$row['split_id'];
+            if (!isset($groups[$sid])) {
+                $groups[$sid] = ['date' => $row['datum'], 'parts' => []];
+            }
+            $groups[$sid]['parts'][(int)$row['split_order']] = [
+                'uid'   => (int)$row['uid'],
+                'valid' => (int)$row['valid'],
+            ];
+        }
+        $stmt->close();
+        return $groups;
+    }
+
+    /**
+     * Local splits that LOGA does not have yet and that can be created.
+     *
+     * Only brand-new splits are returned: if either side already carries the
+     * split shortcut as a plain (unlinked) shift, the group is left to the
+     * normal REST path. A split that already exists in LOGA is skipped.
+     *
+     * @return array<int,array{splitId:string,date:string,ownerPnr:string,partnerPnr:string,shortcut:string,maskShiftId:string}>
+     */
+    private function collectMissingSplits(array $currentLogaData): array {
+        $currentShifts = $this->extractCurrentShifts($currentLogaData);
+        $groups = $this->getLocalSplitGroups();
+        $intents = [];
+
+        foreach ($groups as $splitId => $group) {
+            $owner   = $group['parts'][0] ?? null;
+            $partner = $group['parts'][1] ?? null;
+            if (!$owner || !$partner) {
+                $this->logger->debug("Split {$splitId}: needs both order 0 and 1, skipped", 'ShiftPusher');
+                continue;
+            }
+
+            $date       = $group['date'];
+            $ownerPnr   = $this->uidToPnr[$owner['uid']] ?? null;
+            $partnerPnr = $this->uidToPnr[$partner['uid']] ?? null;
+            if (!$ownerPnr || !$partnerPnr) {
+                $this->logger->debug("Split {$splitId}: missing PNR, skipped", 'ShiftPusher');
+                continue;
+            }
+
+            $shortcut = $this->splitShiftShortcut((int)$owner['valid'], $date);
+            if ($shortcut === null || !isset($this->shiftIdMap[$shortcut])) {
+                $this->logger->error("Split {$splitId}: no LOGA shift mapping for '{$shortcut}' on {$date}", 'ShiftPusher');
+                continue;
+            }
+
+            $ownerShifts   = $currentShifts[$ownerPnr][$date] ?? [];
+            $partnerShifts = $currentShifts[$partnerPnr][$date] ?? [];
+
+            // Already a split in LOGA → nothing to create.
+            $splitExists = false;
+            foreach ($ownerShifts as $s) {
+                if (!empty($s['splitId'])) { $splitExists = true; break; }
+            }
+            if ($splitExists) {
+                continue;
+            }
+
+            // Brand-new only: do not fight an existing unlinked shift.
+            if (self::hasShortcut($ownerShifts, $shortcut) || self::hasShortcut($partnerShifts, $shortcut)) {
+                $this->logger->info("Split {$splitId}: LOGA already has a '{$shortcut}' shift on {$date}; not auto-creating", 'ShiftPusher');
+                continue;
+            }
+
+            $intents[] = [
+                'splitId'     => (string)$splitId,
+                'date'        => $date,
+                'ownerPnr'    => (string)$ownerPnr,
+                'partnerPnr'  => (string)$partnerPnr,
+                'shortcut'    => $shortcut,
+                'maskShiftId' => self::toMaskShiftId($this->shiftIdMap[$shortcut]),
+            ];
+        }
+
+        return $intents;
+    }
+
+    /**
+     * Create the missing splits in LOGA through the Mask action.
+     *
+     * @return array{handled:array<string,array<string,bool>>,created:int,skipped:int}
+     */
+    private function createMissingSplits(array $currentLogaData): array {
+        $intents = $this->collectMissingSplits($currentLogaData);
+        $handled = [];
+        $created = 0;
+        $failed  = 0;
+
+        foreach ($intents as $intent) {
+            try {
+                $this->getSplitCreator()->create(
+                    $intent['ownerPnr'],
+                    $intent['partnerPnr'],
+                    $intent['date'],
+                    $intent['maskShiftId'],
+                    LOGA_SPLIT_OBJS_ID
+                );
+                $handled[$intent['ownerPnr']][$intent['date']] = true;
+                $handled[$intent['partnerPnr']][$intent['date']] = true;
+                $created++;
+                $this->logger->info(
+                    "Split created in LOGA: {$intent['date']} owner={$intent['ownerPnr']} "
+                    . "partner={$intent['partnerPnr']} shift={$intent['maskShiftId']}",
+                    'ShiftPusher'
+                );
+            } catch (\Throwable $e) {
+                $failed++;
+                $this->logger->error(
+                    "Split creation failed for {$intent['date']} "
+                    . "({$intent['ownerPnr']}/{$intent['partnerPnr']}): " . $e->getMessage(),
+                    'ShiftPusher'
+                );
+            }
+        }
+
+        return ['handled' => $handled, 'created' => $created, 'skipped' => $failed];
+    }
+
+    /**
+     * Remove the split parts (those carrying a splitId) for the (pnr,date)
+     * pairs whose split was just created via the Mask action, so the REST push
+     * does not add them as unlinked shifts.
+     */
+    private function filterHandledSplitParts(array $changes, array $handled): array {
+        $out = [];
+        foreach ($changes as $change) {
+            $pnr  = (string)$change['pnr'];
+            $date = $change['date'];
+
+            if (isset($handled[$pnr][$date])) {
+                $isSplitPart = fn($s) => is_array($s) && !empty($s['splitId']);
+                $change['toAdd']    = array_values(array_filter($change['toAdd'], fn($s) => !$isSplitPart($s)));
+                $change['toDelete'] = array_values(array_filter($change['toDelete'], fn($s) => !$isSplitPart($s)));
+            }
+
+            if (!empty($change['toAdd']) || !empty($change['toDelete'])) {
+                $out[] = $change;
+            }
+        }
+        return $out;
+    }
+
+    /** Lazily create the Mask-action split creator. */
+    private function getSplitCreator(): LogaSplitCreator {
+        if ($this->splitCreator === null) {
+            $this->splitCreator = new LogaSplitCreator(
+                $this->client,
+                $this->auth->getRuntimeConfig(),
+                $this->logger
+            );
+        }
+        return $this->splitCreator;
     }
 
     // ─── LOGA API Communication ─────────────────────────────────────────────

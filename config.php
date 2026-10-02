@@ -80,6 +80,18 @@ if (!defined('LOGA_PROTECTED_SHIFTS')) {
     define('LOGA_PROTECTED_SHIFTS', ['AT']);
 }
 
+// ── Dienstsplit creation via the Mask action ───────────────────────────────
+// LOGA ignores the split linkage in the REST planshifts call, so a locally
+// declared split that LOGA does not have yet is created through the Mask
+// callMaskAction (LogaSplitCreator). Disable to keep the pusher REST-only.
+if (!defined('LOGA_SPLIT_CREATE_ENABLED')) {
+    define('LOGA_SPLIT_CREATE_ENABLED', (bool)($_ENV['LOGA_SPLIT_CREATE_ENABLED'] ?? true));
+}
+// Object short id used by the split Mask action (institution-specific).
+if (!defined('LOGA_SPLIT_OBJS_ID')) {
+    define('LOGA_SPLIT_OBJS_ID', $_ENV['LOGA_SPLIT_OBJS_ID'] ?? 'VSÄDNCH');
+}
+
 // ── Mask bootstrap (required before ANY Mask privateRPC) ───────────────────
 // The PEP mask must be "opened" in the server session first, otherwise every
 // MaskDataGwtService/MaskActionSrv call answers HTTP 500. This is the first
