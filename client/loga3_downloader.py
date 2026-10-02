@@ -719,22 +719,27 @@ class GeneratedDocuments:
         else:
             documents = list(self._dashboard_documents())
 
-        counts = {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+        counts = {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0, "errors": 0}
         LOG.info("Documente gasite prin %s: %d", source, len(documents))
         for index, document in enumerate(documents, 1):
             if not verify_all and self.store.can_skip(document.relative, document.fingerprint):
                 counts["skipped"] += 1
                 LOG.info("[%d/%d] neschimbat (metadata): %s", index, len(documents), document.title)
                 continue
-            response = self.client.request(
-                "GET", document.download_url, expected=f"download {document.title}"
-            )
-            temporary = self._write_download(response, document.title)
-            result = self.store.ingest(
-                temporary, document.relative, document.metadata, document.fingerprint
-            )
-            counts[result.status] = counts.get(result.status, 0) + 1
-            LOG.info("[%d/%d] %s: %s", index, len(documents), result.status, result.target)
+            try:
+                response = self.client.request(
+                    "GET", document.download_url, expected=f"download {document.title}"
+                )
+                temporary = self._write_download(response, document.title)
+                result = self.store.ingest(
+                    temporary, document.relative, document.metadata, document.fingerprint
+                )
+                counts[result.status] = counts.get(result.status, 0) + 1
+                LOG.info("[%d/%d] %s: %s", index, len(documents), result.status, result.target)
+            except LogaError as exc:
+                # Un document indisponibil nu trebuie sa opreasca restul listei.
+                counts["errors"] += 1
+                LOG.error("[%d/%d] %s: %s", index, len(documents), document.title, exc)
             time.sleep(0.25)
         return counts
 
@@ -764,10 +769,13 @@ class GeneratedDocuments:
                 title += "." + extension
             created_month = self._created_month(item) or "unknown-month"
             metadata = {"source": "dashboard", **item}
+            # Mai multe documente pot purta acelasi nume in aceeasi luna
+            # (ex. trei "Abrechnung AN Standard" pentru luni diferite).
+            # docId-ul garanteaza un nume local unic si stabil pentru dedup.
             yield RemoteDocument(
                 source="dashboard",
                 title=title,
-                relative=Path("generated") / created_month / safe_name(title),
+                relative=Path("generated") / created_month / safe_name(f"{doc_id}_{title}"),
                 download_url=f"private/document?document-id={quote(doc_id)}",
                 metadata=metadata,
             )

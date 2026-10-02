@@ -224,6 +224,42 @@ python loga3_downloader.py reports --start 2024-10 --only-missing
 Un exemplu complet, cu envelope-urile capturate, este în
 `rpc_profiles.example.json`.
 
+## Private Cloud — Gehaltsabrechnungen și alte documente (finding, 2026-10-03)
+
+Widget-ul „Private Cloud" folosește masca L3 `LMADOKMT` (security
+`LMAWADOK`). Fluxul complet, capturat:
+
+```text
+GET  private/api/dashboard/personalCloud/loadFiles?securityId=LMAWADOK&maskId=LMADOKMT
+POST privateRPC/maskCreationService   openMask|8l4|LMADOKMT|...        → instanța LMADOKMT_<millis>
+POST privateRPC/maskActionService     LMADOKMT_<i>$loadMenus
+POST privateRPC/maskActionService     LMADOKMT_<i>$indexFilesForElasticSearch
+POST privateRPC/maskActionService     LMADOKMT_<i>$loadFilesForScreen
+POST privateRPC/maskActionService     LMADOKMT_<i>$getNewItemsBadgeCount
+POST privateRPC/maskActionService     LMADOKMT_<i>$generatePreview|2wa|<fileId>
+POST privateRPC/maskActionService     LMADOKMT_<i>$saveFileAccessInfo|2wa|<fileId>
+GET  private/api/dashboard/personalCloud/loadPreview/<index>/GENERATED  → imagine PNG
+GET  private/document?document-id=<id>                                  → PDF
+```
+
+- `loadFiles` întoarce `{name, extension, docId, menuType:"GENERATED", created,
+  formattedCreationDate, payslip, ...}`. Când masca nu e deschisă, `docId` sunt
+  indici locali (0,1,2); după `openMask` devin id-uri globale (ex. 67,71,106).
+- **Numele real** (cu lună și tip) vine din `generatePreview`, nu din `loadFiles`:
+  `Abrechnung AN Standard_September_2026.pdf` sau
+  `Meldebescheinigung Zusatzversorgung AN_Januar_2026.pdf`. Deci Cloud-ul nu
+  conține doar fluturași de salariu; există un caz special în ianuarie
+  (Meldebescheinigung). Descărcarea are și `Content-Disposition` cu același nume.
+- `loadPreview/<index>/GENERATED` întoarce un **PNG** (funcționează și din
+  sesiunea clientului).
+
+**Blocaj rămas:** `private/document?document-id=<id>` nu folosește `docId`-ul din
+`loadFiles`; este un id (aparent secvențial) rezolvat de server doar în sesiunea
+care a deschis Cloud-ul prin fluxul aplicației. Din sesiunea clientului (chiar și
+după `openMask` + `loadFilesForScreen`) răspunde **500**. Clientul poate deci
+lista fișierele și numele lor reale, dar descărcarea PDF necesită încă un pas
+(maparea fileId → document-id), care trebuie capturat.
+
 ## Date locale și protecție
 
 ```text
