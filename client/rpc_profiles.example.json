@@ -1,0 +1,41 @@
+{
+  "version": "2026-10-03",
+  "_comment": [
+    "Profil RPC pentru rapoartele proprietare LOGA (masca L3 'Zeitdaten').",
+    "Envelope-urile de mai jos sunt capturi reale (build 20260813015921482).",
+    "Placeholderele folosesc acolade duble, ex. {{XSRF}}.",
+    "Se completeaza doar token-ul XSRF, module base si identitatea; restul",
+    "cuplajelor (8l4, 22p, 2wa, 2vh, 37j, 37i, LTW ...) apartin build-ului.",
+    "Copie in rpc_profiles.json (ignorat de git) si seteaza LOGA_MAN /",
+    "LOGA_AK / LOGA_PNR. Sectiunea 'requests' ruleaza in ordine, iar valorile",
+    "din 'extract' devin placeholdere pentru request-urile urmatoare.",
+    "La schimbarea build-ului LOGA, recaptureaza request-urile (vezi FINDINGS.md)."
+  ],
+  "delay_seconds": 1.0,
+  "actions": {
+    "time_protocol": {
+      "smart_id": "LAGSDZPG",
+      "filename": "zeitprotokoll.pdf",
+      "requests": [
+        {
+          "rpc_service": "maskCreationService",
+          "mask": "LZWZEITD",
+          "envelope": "7|3|8|{{L2_MODULE_BASE}}|B0DCAB5410DA1EFFB4E3F4A1A02669CE|49|{{XSRF}}|_|openMask|8l4|LZWZEITD|1|2|3|4|5|6|1|7|8|",
+          "extract": {
+            "MASK_INSTANCE": "(LZWZEITD_\\d+)"
+          }
+        },
+        {
+          "rpc_service": "maskActionService",
+          "mask": "LZWZEITD",
+          "envelope": "7|3|14|{{L2_MODULE_BASE}}|B0DCAB5410DA1EFFB4E3F4A1A02669CE|49|{{XSRF}}|_|actionMask|8l4|22p|{{MASK_INSTANCE}}$generateTimeDocument|2wa|{{MAN}}{{AK}}{{PNR}}1|2vh|37j|37i|1|2|3|4|5|6|2|7|8|9|8|2|10|7|11|12|13|14|LTW|14|LT0|"
+        }
+      ],
+      "download": {
+        "poll_dashboard": true,
+        "title_regex": "(Zeitprotokoll|Zeitdaten|Zeit)",
+        "timeout_seconds": 90
+      }
+    }
+  }
+}

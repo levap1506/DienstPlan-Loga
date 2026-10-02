@@ -179,6 +179,51 @@ Crearea este idempotentă (re-trimiterea nu duplică split-ul).
 `loga/LogaSplitCreator.php` (creare funcțională: bootstrap mască + template),
 `loga/client/loga_rpc.py` (+ self-test).
 
+## Masca L3 „Zeitdaten" și exporturile proprietare (finding, 2026-10-03)
+
+După login, masca L3 „Zeitdaten" (`LZWZEITD`) se creează printr-un singur apel
+GWT:
+
+```text
+POST privateRPC/maskCreationService
+envelope: 7|3|8|<moduleBase>|B0DCAB5410DA1EFFB4E3F4A1A02669CE|49|<xsrf>|_|openMask|8l4|LZWZEITD|1|2|3|4|5|6|1|7|8|
+```
+
+Răspunsul conține instanța de mască `LZWZEITD_<millis>` și **toate**
+identificatoarele Smarte Dinge (`LAGSDKPF`, `LAGSDZPG`, `LAGSDZWS`, …).
+
+Operațiile pe mască sunt `maskActionService.actionMask`:
+
+```text
+envelope: ...|actionMask|8l4|22p|LZWZEITD_<millis>$<metoda>|2wa|<man><ak><pnr>1|...
+metode: sendCurrentTimeKontoToClient, loadFilterData, generateTimeDocument, logUserAction
+```
+
+Datele lunare vin și prin `calendarCacheService.getData` (cu masca `LZWZEITD`).
+În `logUserAction` apar acțiunile „PDF generieren" (`LAGSDKPF`,
+`documentdownload`) și „Zeitprotokoll generieren" (`LAGSDZPG`, `documentalt`).
+Documentul generat se descarcă prin:
+
+```text
+GET private/document?xsrf=<xsrf>&document-id=<id>
+```
+
+Fiecare rulare creează o instanță nouă (id-ul include un millis), deci nu se
+refolosește între sesiuni.
+
+**Client:** `LogaClient.private_rpc()` trimite apelurile criptate, iar
+`MonthlyRecipeRunner` execută un profil `rpc_profiles.json` cu `rpc_service` +
+`envelope` (templat cu `{{XSRF}}`, `{{L2_MODULE_BASE}}`, `{{MAN}}{{AK}}{{PNR}}`)
+și `extract` (ex. `MASK_INSTANCE`), apoi descarcă PDF-ul prin
+`private/document?document-id=...` sau prin `poll_dashboard`. Comanda:
+
+```text
+python loga3_downloader.py reports --start 2024-10 --only-missing
+```
+
+Un exemplu complet, cu envelope-urile capturate, este în
+`rpc_profiles.example.json`.
+
 ## Date locale și protecție
 
 ```text

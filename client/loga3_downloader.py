@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -296,6 +296,19 @@ class RuntimeConfigResolver:
         return None
 
 
+@dataclass
+class TextResponse:
+    """Raspuns sintetic pentru un apel privateRPC decriptat (fara HTTP nou)."""
+
+    text: str
+    status_code: int = 200
+    headers: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def content(self) -> bytes:
+        return self.text.encode("latin1")
+
+
 class LogaClient:
     def __init__(
         self,
@@ -494,6 +507,41 @@ class LogaClient:
             raise LogaError(
                 f"HTTP {response.status_code} la {operation}: {preview}"
             )
+
+    def private_rpc(self, service: str, envelope: str, *, mask: str = "LWSPEP") -> str:
+        """Trimite un apel ``privateRPC/<service>`` criptat si intoarce envelope-ul decriptat.
+
+        ``envelope`` este textul compus (``7|3|...|_|<metoda>|<args>``); tokenul
+        XSRF curent este folosit atat pentru criptare, cat si pentru headere.
+        """
+        if self.runtime is None or self.xsrf_token is None:
+            raise LogaError("Clientul nu este autentificat (lipseste XSRF).")
+        try:
+            from loga_rpc import decrypt_body, encrypt_body, rpc_headers
+        except ImportError as exc:  # pragma: no cover - depends on layout
+            raise LogaError(
+                "Modulul loga_rpc.py lipseste langa acest script."
+            ) from exc
+
+        module_base = urljoin(
+            self.base_url, f"bts/{self.runtime.loga_version}/L2Main/"
+        )
+        headers = {
+            "Origin": self.origin,
+            "Referer": urljoin(self.base_url, "private/layout?action=afterlogin"),
+            **rpc_headers(
+                module_base, self.runtime.l2_permutation, self.xsrf_token, mask=mask
+            ),
+        }
+        body = encrypt_body(self.xsrf_token, envelope)
+        response = self.session.post(
+            urljoin(self.base_url, f"privateRPC/{service}"),
+            data=body.encode("ascii"),
+            headers=headers,
+            timeout=self.timeout,
+        )
+        self._raise_for_status(response, f"privateRPC {service}")
+        return decrypt_body(self.xsrf_token, response.text)
 
 
 @dataclass(frozen=True)
@@ -1272,7 +1320,10 @@ class MonthlyRecipeRunner:
             for action_name in ("calendar_pdf", "time_protocol"):
                 action = self.profile["actions"].get(action_name)
                 if not isinstance(action, Mapping):
-                    raise LogaError(f"Profilul nu defineste actiunea {action_name!r}.")
+                    LOG.warning(
+                        "Profilul nu defineste actiunea %s; se sare.", action_name
+                    )
+                    continue
                 filename = safe_name(
                     action.get("filename")
                     or ("calendar.pdf" if action_name == "calendar_pdf" else "zeitprotokoll.pdf")
@@ -1313,26 +1364,55 @@ class MonthlyRecipeRunner:
                 if item.get("docId") is not None
             }
 
-        last_response: Response | None = None
+        last_response: Any = None
         for number, raw_spec in enumerate(requests_spec, 1):
             if not isinstance(raw_spec, Mapping):
                 raise LogaError(f"Request invalid in actiunea {action_name}.")
             spec = render_template(raw_spec, context)
-            method = str(spec.get("method", "POST")).upper()
-            url = str(spec.get("url", ""))
-            if not url:
-                raise LogaError(f"Request-ul {number} din {action_name} nu are URL.")
-            kwargs: dict[str, Any] = {
-                "headers": spec.get("headers", {}),
-                "params": spec.get("params", {}),
-                "add_xsrf": bool(spec.get("add_xsrf", True)),
-                "expected": f"{action_name}, request {number}",
-            }
-            if "json" in spec:
-                kwargs["json"] = spec["json"]
-            elif "body" in spec:
-                kwargs["data"] = str(spec["body"]).encode("utf-8")
-            last_response = self.client.request(method, url, **kwargs)
+            rpc_service = spec.get("rpc_service")
+            if rpc_service:
+                envelope = str(spec.get("envelope", ""))
+                if not envelope:
+                    raise LogaError(
+                        f"Request-ul {number} din {action_name} nu are 'envelope'."
+                    )
+                decrypted = self.client.private_rpc(
+                    str(rpc_service), envelope, mask=str(spec.get("mask", "LWSPEP"))
+                )
+                last_response = TextResponse(decrypted)
+            else:
+                method = str(spec.get("method", "POST")).upper()
+                url = str(spec.get("url", ""))
+                if not url:
+                    raise LogaError(f"Request-ul {number} din {action_name} nu are URL.")
+                kwargs: dict[str, Any] = {
+                    "headers": spec.get("headers", {}),
+                    "params": spec.get("params", {}),
+                    "add_xsrf": bool(spec.get("add_xsrf", True)),
+                    "expected": f"{action_name}, request {number}",
+                }
+                if "json" in spec:
+                    kwargs["json"] = spec["json"]
+                elif "body" in spec:
+                    kwargs["data"] = str(spec["body"]).encode("utf-8")
+                last_response = self.client.request(method, url, **kwargs)
+
+            # Valorile extrase (ex. instanta mastii, document-id) devin
+            # disponibile ca placeholdere in request-urile urmatoare.
+            for name, pattern in (spec.get("extract") or {}).items():
+                match = re.search(str(pattern), last_response.text)
+                if not match:
+                    raise LogaError(
+                        f"{action_name}: nu am gasit '{name}' in raspunsul "
+                        f"request-ului {number}."
+                    )
+                groups = match.groupdict() or {}
+                if "value" in groups:
+                    context[name] = groups["value"]
+                elif match.groups():
+                    context[name] = match.group(1)
+                else:
+                    context[name] = match.group(0)
 
         if last_response is None:
             raise LogaError(f"Actiunea {action_name} nu a produs raspuns.")
@@ -1445,6 +1525,9 @@ class MonthlyRecipeRunner:
             "L2_MODULE_BASE": l2_base,
             "L2_PERMUTATION": self.client.runtime.l2_permutation,
             "DATA_MINING_STRONG_NAME": self.client.runtime.data_mining_strong_name or "",
+            "MAN": os.getenv("LOGA_MAN", ""),
+            "AK": os.getenv("LOGA_AK", ""),
+            "PNR": os.getenv("LOGA_PNR", ""),
             "ACTION": action_name,
             "SMART_ID": str(action.get("smart_id") or SMART_IDS[action_name]),
             "YEAR": str(year),
@@ -1505,6 +1588,21 @@ def build_parser() -> argparse.ArgumentParser:
     all_cmd.add_argument("--only-missing", action="store_true")
 
     sub.add_parser("self-test", help="Teste locale, fara retea si fara login")
+
+    reports = sub.add_parser(
+        "reports", help="Descarca rapoartele proprietare LOGA (Mask) pentru una sau mai multe luni"
+    )
+    reports.add_argument(
+        "--profile",
+        type=Path,
+        default=None,
+        help="Calea catre rpc_profiles.json (implicit: langa script)",
+    )
+    reports.add_argument(
+        "--start", type=parse_year_month, default=parse_year_month(DEFAULT_START_MONTH)
+    )
+    reports.add_argument("--end", type=parse_year_month, default=None)
+    reports.add_argument("--only-missing", action="store_true")
     return parser
 
 
@@ -1644,6 +1742,22 @@ def main(argv: list[str] | None = None) -> int:
         runner = MonthlyDirectExporter(client, store)
         stats = runner.run(args.start, end, only_missing=args.only_missing)
         print_stats("Rapoarte lunare", stats)
+
+    if args.command == "reports":
+        profile_path = args.profile or (
+            Path(__file__).resolve().parent / "rpc_profiles.json"
+        )
+        if not profile_path.is_file():
+            example = Path(__file__).resolve().parent / "rpc_profiles.example.json"
+            raise LogaError(
+                f"Profilul RPC nu exista: {profile_path}. Copiaza "
+                f"{example.name} in rpc_profiles.json si completeaza campurile "
+                "lipsa (vezi README.md)."
+            )
+        end = args.end or last_completed_month()
+        runner = MonthlyRecipeRunner(client, store, generated, profile_path)
+        stats = runner.run(args.start, end, only_missing=args.only_missing)
+        print_stats("Rapoarte Mask", stats)
     return 0
 
 

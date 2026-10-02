@@ -18,7 +18,9 @@ soluției, consultați [FINDINGS.md](FINDINGS.md).
 PDF-urile lunare sunt construite din răspunsul oficial al calendarului din
 dashboard, iar `calendar-data.json` este păstrat lângă ele pentru audit. Ele
 reproduc informația accesibilă prin calendar, însă nu sunt o copie binară a
-exporturilor proprietare „Smarte Dinge”.
+exporturilor proprietare „Smarte Dinge”. Exportul proprietar al serverului
+(„Zeitprotokoll generieren”) poate fi descărcat separat prin comanda `reports`
+(cu profilul RPC din masca L3 „Zeitdaten”), vezi mai jos.
 
 Fiecare fișier este inventariat cu SHA-256. Un conținut deja prezent nu se
 descarcă din nou; la schimbare, versiunea precedentă se păstrează în
@@ -76,6 +78,21 @@ fișierele deja existente:
 
 Rularea fără subcomandă execută ambele căi: documentele dashboard și rapoartele
 lunare.
+
+Rapoartele proprietare (masca L3 „Zeitdaten”, `privateRPC`) se descarcă pe baza
+unui profil capturat. Copiați `rpc_profiles.example.json` în `rpc_profiles.json`
+(ignorat de git) și setați `LOGA_MAN`, `LOGA_AK`, `LOGA_PNR`:
+
+```powershell
+$env:LOGA_MAN = "SBK"; $env:LOGA_AK = "SBK"; $env:LOGA_PNR = "3017484"
+.venv\Scripts\python loga3_downloader.py reports `
+  --start 2024-10 --end 2026-08 --only-missing
+```
+
+Profilul ține, în ordine, apelurile `privateRPC` (masca se creează întâi cu
+`openMask`, apoi `actionMask`), valorile extrase (`{{MASK_INSTANCE}}`) și modul
+de descărcare (`private/document?document-id=...`). Detalii în
+[FINDINGS.md](FINDINGS.md).
 
 ## Structura rezultatului
 
