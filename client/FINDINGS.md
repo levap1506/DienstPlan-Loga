@@ -93,6 +93,27 @@ PDF-urile scriptului sunt rapoarte locale bazate pe datele calendarului. Permit 
 
 Dacă este obligatoriu ca rezultatul să fie exact exportul proprietar LOGA, este necesară o captură autorizată request/response pentru fiecare Smart Thing și validarea ei pe mai multe luni. Această extensie nu este inclusă acum.
 
+## privateRPC — transport criptat (implementat)
+
+Apelurile `/loga3/privateRPC/<Service>` (Mask/PEP, DataMining, ServerData etc.)
+sunt GWT-RPC împachetat cu o criptare de transport. A fost derivată din JS-ul
+public L2Main și este implementată în `loga_rpc.py`:
+
+- cheia AES-192 = `b"1$7d%C&S"` + `token[8:24]`, unde `token` este valoarea
+  `Rpc-Xsrf` (aceeași ca `?xsrf=` din REST);
+- cifru: **AES-192-CBC, IV zero, PKCS#7** (determinist);
+- corpul requestului = hex( AES( base64( `7|3|<n>|<moduleBase>|<strongName>|49|<token>|_|<method>|<args>` ) ) );
+- headere: `Content-Type: text/x-gwt-rpc; charset=utf-8`, `Rpc-Xsrf`,
+  `X-GWT-Module-Base: .../<versiune>/L2Main/`, `X-GWT-Permutation`,
+  `rpc-context-app: LOGA`, `rpc-context-msk: LWSPEP`.
+
+Astfel, un corp capturat poate fi **decriptat**, șablonat (token/lună/ID) și
+**re-criptat** pentru fiecare apel, în loc să fie rejucat opac. Argumentele
+`<args>` rămân serializarea GWT proprie fiecărui build, deci se folosesc
+șabloane din capturi, nu construcție de la zero. `loga_rpc.py` conține un
+auto-test cu un vector fix care verifică atât decriptarea, cât și faptul că
+`encrypt(decrypt(x))` reproduce exact corpul original.
+
 ## Date locale și protecție
 
 ```text
