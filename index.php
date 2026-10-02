@@ -36,6 +36,7 @@ require_once __DIR__ . '/LogaExplorer.php';
 // DB
 require_once dirname(__DIR__) . '/db_config.php';
 require_once dirname(__DIR__) . '/mysql_config.php';
+require_once dirname(__DIR__) . '/assets.php';
 
 // ─── Context Detection ─────────────────────────────────────────────────────
 
@@ -2123,7 +2124,7 @@ require dirname(__DIR__) . '/navbar.php';
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-<script src="../js/nav-cache-refresh.js"></script>
+<script src="<?php echo dp_asset('js/nav-cache-refresh.js', '../'); ?>"></script>
 <script>
 // ─── State ──────────────────────────────────────────────────────────────────
 let currentConflicts = [];
