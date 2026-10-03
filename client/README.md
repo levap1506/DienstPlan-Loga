@@ -13,7 +13,10 @@ soluției, consultați [FINDINGS.md](FINDINGS.md).
 - datele calendarului pentru fiecare lună de la octombrie 2024 până la ultima
   lună încheiată;
 - două PDF-uri locale pentru fiecare lună: `kalendarium.pdf` și
-  `zeitprotokoll.pdf`.
+  `zeitprotokoll.pdf`;
+- (opțional) exportul **proprietar** „Zeitprotokoll generieren” prin `privateRPC`
+  (`reports`);
+- (opțional) trimite cereri „Erfassung Rufbereitschaft Einsatz” (`request`).
 
 PDF-urile lunare sunt construite din răspunsul oficial al calendarului din
 dashboard, iar `calendar-data.json` este păstrat lângă ele pentru audit. Ele

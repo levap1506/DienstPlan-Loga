@@ -4,10 +4,12 @@ Acest document descrie observațiile tehnice și limitele clientului. Nu conțin
 
 ## Obiectiv
 
-Au fost analizate două trasee după autentificare:
+Au fost analizate trasee după autentificare:
 
 1. **Generierte Dokumente**: documente grupate pe luni; se descarcă doar elementele noi sau modificate.
 2. **Zeiten**: selectarea unei luni și producerea unui calendar și Zeitprotokoll pentru fiecare lună încheiată.
+3. **privateRPC (Mask/PEP)**: transport criptat GWT; folosit pentru exportul proprietar „Zeitprotokoll generieren" (`reports`) și pentru crearea de Dienstsplit-uri.
+4. **Cereri Smarte Dinge**: „Erfassung Rufbereitschaft Einsatz" (`request`) — Kommen/Gehen și Telefoneinsatz, direct din CLI.
 
 `loga3_downloader.py` este un client HTTP direct, fără Selenium, Playwright sau un browser automatizat.
 
@@ -306,6 +308,12 @@ Comandă: `loga3_downloader.py request --date YYYY-MM-DD --kommen HH:MM
 --gehen HH:MM [--telefon-anfang HH:MM --telefon-ende HH:MM]` (orele de telefon
 sunt în ziua următoare). Șabloanele capturate sunt în `loga_requests.py`.
 
+Un Antrag poate conține **mai multe** perechi `Kommen`/`Gehen` și mai multe
+`Telefoneinsatz`, în aceeași zi sau după miezul nopții; formatul CLI pentru
+multi-intrare (flag-uri repetate, sufix `+1` pentru ziua următoare) este
+proiectat dar necesită o captură multi-intrare pentru a templata corect setul de
+evenimente.
+
 ## Date locale și protecție
 
 ```text
@@ -326,7 +334,19 @@ downloads/
 
 - Parsarea sintactică Python a trecut pentru versiunea publicată.
 - `self-test` testează offline calculul lunilor, manifestul SHA-256, arhivarea și randarea PDF deterministă.
-- Nu a fost efectuată în acest checkout o descărcare autenticată cu un cont LOGA real; prima rulare cu contul utilizatorului trebuie să confirme accesul și structura răspunsurilor curente.
+- Verificat live (2026-10-03) din client, fără browser:
+  - `reports` → Zeitprotokoll PDF real (`private/document?document-id=…`);
+  - `request` → cerere Rufbereitschaft persistată (`…submitEventData` + `rest/frmpart`);
+  - crearea de Dienstsplit prin `privateRPC` (bootstrap mască + `callMaskAction`).
+
+**Limitări rămase:**
+- `request` suportă deocamdată **o singură** pereche `Kommen`/`Gehen` și **una**
+  `Telefoneinsatz` per zi. Un Antrag poate conține mai multe perechi (în aceeași
+  zi sau după miezul nopții); generalizarea necesită încă o captură multi-intrare.
+- Descărcarea PDF din Private Cloud (`document-id`) rămâne legată de sesiunea
+  care a deschis Cloud-ul (vezi secțiunea Private Cloud).
+- Șabloanele `submitEventData` conțin identitatea `SBK/SBK/3017484`; pentru altă
+  persoană trebuie înlocuită.
 
 Comenzi utile:
 
@@ -335,6 +355,17 @@ python loga3_downloader.py self-test
 python loga3_downloader.py --verbose login
 python loga3_downloader.py generated --source dashboard
 python loga3_downloader.py monthly --start 2024-10
+python loga3_downloader.py reports --start 2024-10 --only-missing
+python loga3_downloader.py request --date 2026-09-10 --kommen 16:01 --gehen 22:41 `
+  --telefon-anfang 00:24 --telefon-ende 00:28
 ```
+
+- `generated` — documentele dashboard/TalentCard (Cloud, inclusiv fluturași de
+  salariu și Meldebescheinigung); numele local include `docId` pentru unicitate.
+- `monthly` — calendar + Zeitprotokoll **local** (ReportLab), pe lună.
+- `reports` — exportul **proprietar** Zeitprotokoll prin `privateRPC` (profil
+  `rpc_profiles.json`).
+- `request` — cerere Rufbereitschaft (`Kommen`/`Gehen` + opțional
+  `Telefoneinsatz`) pentru o zi.
 
 TLS este verificat implicit. `--insecure` este numai pentru diagnostic pe stații care nu pot valida certificatul server.
