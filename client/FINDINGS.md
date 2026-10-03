@@ -288,8 +288,23 @@ blocul normal (care trebuie păstrat). Pentru push e nevoie de: citirea zilei,
 înlocuirea doar a perechii `Kommen`/`Gehen` (GUID-uri noi) și retrimiterea
 întregului set — adică reconstrucția modelului de evenimente al măștii.
 
-**De făcut:** de stabilit câmpurile variabile (dată, oră început/sfârșit, tip)
-pentru a templata payload-ul și a-l trimite din client (comanda `request`).
+**Rezolvat (2026-10-03):** secvența completă, verificată din client:
+
+```text
+openMask LZWZEITD
+…$loadInitialEventData      (înregistrează evenimentele zilei în mască)
+…$loadMaskPartData          (deschide formularul)
+…$submitEventData           (trimite setul zilei)
+POST rest/frmpart           operationType=update, dataSource=ds_<inst>$timeAttendanceServerMaskPart
+```
+
+`submitEventData` singur **nu persistă** (răspunde `//OK[0,1,["310"],3,7]`, dar
+nu scrie nimic); `frmpart` este commit-ul efectiv. GUID-urile evenimentelor
+trebuie regenerate (`uuid4`) la fiecare trimitere.
+
+Comandă: `loga3_downloader.py request --date YYYY-MM-DD --kommen HH:MM
+--gehen HH:MM [--telefon-anfang HH:MM --telefon-ende HH:MM]` (orele de telefon
+sunt în ziua următoare). Șabloanele capturate sunt în `loga_requests.py`.
 
 ## Date locale și protecție
 

@@ -1611,6 +1611,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reports.add_argument("--end", type=parse_year_month, default=None)
     reports.add_argument("--only-missing", action="store_true")
+
+    request_cmd = sub.add_parser(
+        "request", help="Trimite o cerere Rufbereitschaft (Smarte Dinge L3SDCHOMF8U)"
+    )
+    request_cmd.add_argument("--date", required=True, help="Ziua, format YYYY-MM-DD")
+    request_cmd.add_argument("--kommen", required=True, help="Ora Kommen, HH:MM")
+    request_cmd.add_argument("--gehen", required=True, help="Ora Gehen, HH:MM")
+    request_cmd.add_argument("--telefon-anfang", default=None, help="Telefoneinsatz Anfang, HH:MM")
+    request_cmd.add_argument("--telefon-ende", default=None, help="Telefoneinsatz Ende, HH:MM")
     return parser
 
 
@@ -1736,6 +1745,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "login":
         print("Login direct HTTP: OK")
+        return 0
+
+    if args.command == "request":
+        from loga_requests import parse_date, parse_time, submit_rufbereitschaft
+
+        day = parse_date(args.date)
+        kommen = parse_time(args.kommen)
+        gehen = parse_time(args.gehen)
+        telefon_anfang = parse_time(args.telefon_anfang) if args.telefon_anfang else None
+        telefon_ende = parse_time(args.telefon_ende) if args.telefon_ende else None
+        if bool(telefon_anfang) != bool(telefon_ende):
+            raise LogaError(
+                "--telefon-anfang și --telefon-ende trebuie date împreună."
+            )
+        result = submit_rufbereitschaft(
+            client, day, kommen, gehen, telefon_anfang, telefon_ende, LOG
+        )
+        suffix = ""
+        if telefon_anfang:
+            suffix = f" (Telefoneinsatz {telefon_anfang}-{telefon_ende}, ziua următoare)"
+        print(
+            f"Cerere Rufbereitschaft trimisă: {day.isoformat()} "
+            f"Kommen {kommen} → Gehen {gehen}{suffix}"
+        )
+        LOG.debug("instanță mască: %s", result.get("instance"))
         return 0
 
     generated = GeneratedDocuments(client, store)

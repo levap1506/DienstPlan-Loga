@@ -94,6 +94,20 @@ Profilul ține, în ordine, apelurile `privateRPC` (masca se creează întâi cu
 de descărcare (`private/document?document-id=...`). Detalii în
 [FINDINGS.md](FINDINGS.md).
 
+Cerere „Rufbereitschaft" (Smarte Dinge **Erfassung Rufbereitschaft Einsatz**),
+trimisă direct (fără browser) prin `openMask → loadInitialEventData →
+loadMaskPartData → submitEventData → rest/frmpart`:
+
+```powershell
+.venv\Scripts\python loga3_downloader.py request `
+  --date 2026-09-10 --kommen 16:01 --gehen 22:41 `
+  --telefon-anfang 00:24 --telefon-ende 00:28
+```
+
+`--date` este ziua; `Kommen`/`Gehen` se aplică acelei zile, iar `--telefon-*`
+zilei următoare (Telefoneinsatz peste noapte). Fără `--telefon-*` se trimite
+doar perechea `Kommen`/`Gehen`. Blocul normal de lucru rămâne neatins.
+
 ## Structura rezultatului
 
 ```text
