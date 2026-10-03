@@ -421,25 +421,32 @@ class LogaShiftPusher {
             $this->logger->debug("Special user {$user['pnr']}: id=null, identifier=" . var_export($userIdentifier, true) . ", inMap=" . var_export(isset(LOGA_SPECIAL_USERS[$userIdentifier]), true) . ", currentShiftDates=" . count($currentLogaShifts) . ", isWorkDay({$testDate})=" . var_export($this->isWorkDay($testDate), true) . ", expected(" . $testDate . ")=" . json_encode($testExpected) . ", holidays=" . json_encode($this->holidays), 'ShiftPusher');
         }
 
+        // Schimburile protejate (ex. AT) sunt administrate în LOGA: nu trebuie
+        // nici adăugate, nici șterse prin planshifts, deci sunt ignorate pe
+        // ambele părți ale comparației (altfel LOGA răspunde
+        // „Die Schicht AT kann nicht gespeichert werden").
+        $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
+        $stripProtected = static fn(array $shifts): array => array_values(array_filter(
+            $shifts,
+            static fn($s) => !in_array(strtoupper(self::shortcutOf($s)), $protected, true)
+        ));
+
         while ($startDate <= $endDate) {
             $dateStr = $startDate->format('Y-m-d');
             $currentLogaShiftsForDate = $currentLogaShifts[$dateStr] ?? [];
 
-            $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
+            $expectedCmp = $stripProtected(
+                $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries)
+            );
+            $currentCmp = $stripProtected($currentLogaShiftsForDate);
 
-            if (!$this->shiftsMatch($expectedShifts, $currentLogaShiftsForDate)) {
-                // Never delete protected shortcuts (e.g. AT is managed in LOGA).
-                $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
-                $toDelete = array_values(array_filter(
-                    $currentLogaShiftsForDate,
-                    fn($s) => !in_array(strtoupper(self::shortcutOf($s)), $protected, true)
-                ));
+            if (!$this->shiftsMatch($expectedCmp, $currentCmp)) {
                 $changes[] = [
                     'date'           => $dateStr,
-                    'currentShifts'  => $currentLogaShiftsForDate,
-                    'expectedShifts' => $expectedShifts,
-                    'toDelete'       => $toDelete,
-                    'toAdd'          => $expectedShifts,
+                    'currentShifts'  => $currentCmp,
+                    'expectedShifts' => $expectedCmp,
+                    'toDelete'       => $currentCmp,
+                    'toAdd'          => $expectedCmp,
                 ];
             }
 
@@ -678,7 +685,7 @@ class LogaShiftPusher {
      */
     private function getLocalSplitGroups(): array {
         $stmt = $this->conn->prepare(
-            "SELECT datum, uid, split_order, valid FROM plan "
+            "SELECT split_id, datum, uid, split_order, valid FROM plan "
             . "WHERE split_id IS NOT NULL AND datum BETWEEN ? AND ? AND valid IN (1, 2) "
             . "ORDER BY split_id, split_order"
         );
