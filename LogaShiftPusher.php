@@ -239,6 +239,15 @@ class LogaShiftPusher {
         // changes so the two do not fight.
         $splitResult = ['handled' => [], 'created' => 0, 'skipped' => 0];
         if (LOGA_SPLIT_CREATE_ENABLED && !empty($allChanges)) {
+            $splitIntents = $this->collectMissingSplits($currentLogaData);
+
+            // The Mask split needs the owner's base shift to exist and the
+            // partner's day to be completely empty. Send only the owner's
+            // base shift through REST first; never pre-create the partner.
+            if (!empty($splitIntents)) {
+                $this->sendSplitBaseShifts($splitIntents, $allChanges);
+            }
+
             $splitResult = $this->createMissingSplits($currentLogaData);
             if (!empty($splitResult['handled'])) {
                 $allChanges = $this->filterHandledSplitParts($allChanges, $splitResult['handled']);
@@ -833,6 +842,57 @@ class LogaShiftPusher {
         }
 
         return $intents;
+    }
+
+    /**
+     * Send the owner's base shift (no split metadata) before the Mask split.
+     *
+     * The browser sequence requires:
+     *   - owner: base O4/R4 on the day,
+     *   - partner: no shift at all on that day.
+     * Creating the partner through REST blocks the Mask partner call.
+     */
+    private function sendSplitBaseShifts(array $intents, array $changes): void {
+        $prepared = [];
+
+        foreach ($intents as $intent) {
+            foreach ($changes as $change) {
+                if ((string)$change['pnr'] !== (string)$intent['ownerPnr']
+                    || $change['date'] !== $intent['date']) {
+                    continue;
+                }
+
+                $toAdd = [];
+                foreach ($change['toAdd'] as $shift) {
+                    if (!is_array($shift)) {
+                        $toAdd[] = $shift;
+                        continue;
+                    }
+                    // Strip split linkage: this is the unlinked base shift.
+                    $shift['splitId'] = null;
+                    $shift['order']   = null;
+                    $toAdd[] = $shift;
+                }
+
+                $prepared[] = [
+                    'pnr'            => $change['pnr'],
+                    'date'           => $change['date'],
+                    'currentShifts'  => $change['currentShifts'],
+                    'expectedShifts' => $change['expectedShifts'],
+                    'toAdd'          => $toAdd,
+                    'toDelete'       => $change['toDelete'],
+                ];
+                break;
+            }
+        }
+
+        if (!empty($prepared)) {
+            $this->logger->info(
+                'Sending ' . count($prepared) . ' split base shift(s) for owner(s)',
+                'ShiftPusher'
+            );
+            $this->sendBatchedShiftChanges($prepared);
+        }
     }
 
     /**
