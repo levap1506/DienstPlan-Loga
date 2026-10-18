@@ -67,7 +67,39 @@ class LogaSplitCreator {
         // Establish the PEP mask context — without this every Mask call is HTTP 500.
         $this->bootstrapMask($moduleBase, $token, $date);
 
-        $envelope = LogaRpc::fill(LOGA_SPLIT_ACTION_TEMPLATE, [
+        $this->logger->info(
+            "Creating LOGA split: owner={$ownerPnr} partner={$partnerPnr} date={$date} shift={$shiftOriginalId}",
+            'SplitCreator'
+        );
+
+        // 1. Full owner envelope (45 entries) — opens/creates the split and
+        //    carries the employee list. Verified against the browser capture.
+        $ownerEnvelope = LogaRpc::fill(LOGA_SPLIT_OWNER_ACTION, [
+            'MODULE_BASE' => $moduleBase,
+            'TOKEN'       => $token,
+            'FROM_DT'     => $from,
+            'TO_DT'       => $to,
+            'OBJEKT_ID'   => LOGA_OBJEKT_ID,
+        ]);
+        $ownerResponse = $this->client->privateRpc('MaskActionSrv', $ownerEnvelope, $this->runtimeConfig);
+        $ownerDecoded  = $this->decrypt($token, $ownerResponse, 'Owner');
+        $this->logger->info('Owner split response: ' . substr($ownerDecoded ?? $ownerResponse, 0, 300), 'SplitCreator');
+
+        // 2. Partner envelope (31 entries) — adds order 1 for the partner.
+        $partnerEnvelope = LogaRpc::fill(LOGA_SPLIT_PARTNER_ACTION, [
+            'MODULE_BASE' => $moduleBase,
+            'TOKEN'       => $token,
+            'PARTNER_PNR' => $partnerPnr,
+            'FROM_DT'     => $from,
+            'TO_DT'       => $to,
+            'OBJEKT_ID'   => LOGA_OBJEKT_ID,
+        ]);
+        $partnerResponse = $this->client->privateRpc('MaskActionSrv', $partnerEnvelope, $this->runtimeConfig);
+        $partnerDecoded  = $this->decrypt($token, $partnerResponse, 'Partner');
+        $this->logger->info('Partner split response: ' . substr($partnerDecoded ?? $partnerResponse, 0, 300), 'SplitCreator');
+
+        // 3. Legacy 37-entry refresh (the browser sends this last as well).
+        $refreshEnvelope = LogaRpc::fill(LOGA_SPLIT_ACTION_TEMPLATE, [
             'MODULE_BASE'     => $moduleBase,
             'TOKEN'           => $token,
             'PARTNER_PNR'     => $partnerPnr,
@@ -78,58 +110,28 @@ class LogaSplitCreator {
             'FROM_DT'         => $from,
             'TO_DT'           => $to,
         ]);
-
-        $this->logger->info(
-            "Creating LOGA split: owner={$ownerPnr} partner={$partnerPnr} date={$date} shift={$shiftOriginalId}",
-            'SplitCreator'
-        );
-
-        $response = $this->client->privateRpc('MaskActionSrv', $envelope, $this->runtimeConfig);
-
-        $decoded = null;
-        try {
-            $decoded = LogaRpc::decryptBody($token, $response);
-        } catch (\Throwable $e) {
-            $this->logger->debug('Split response not encrypted: ' . substr($response, 0, 120), 'SplitCreator');
-        }
-
-        $this->logger->info(
-            'Split response: ' . substr($decoded ?? $response, 0, 300),
-            'SplitCreator'
-        );
-
-        // The browser sends a second Mask call that creates the partner part
-        // (order 1). Without it, only the owner part persists.
-        $partnerResponse = '';
-        $partnerDecoded  = null;
-        if (defined('LOGA_SPLIT_PARTNER_ACTION')) {
-            $partnerEnvelope = LogaRpc::fill(LOGA_SPLIT_PARTNER_ACTION, [
-                'MODULE_BASE' => $moduleBase,
-                'TOKEN'       => $token,
-                'PARTNER_PNR' => $partnerPnr,
-                'FROM_DT'     => $from,
-                'TO_DT'       => $to,
-                'OBJEKT_ID'   => LOGA_OBJEKT_ID,
-            ]);
-            $partnerResponse = $this->client->privateRpc('MaskActionSrv', $partnerEnvelope, $this->runtimeConfig);
-            try {
-                $partnerDecoded = LogaRpc::decryptBody($token, $partnerResponse);
-            } catch (\Throwable $e) {
-                $this->logger->debug('Partner response not encrypted: ' . substr($partnerResponse, 0, 120), 'SplitCreator');
-            }
-            $this->logger->info(
-                'Partner split response: ' . substr($partnerDecoded ?? $partnerResponse, 0, 300),
-                'SplitCreator'
-            );
-        }
+        $refreshResponse = $this->client->privateRpc('MaskActionSrv', $refreshEnvelope, $this->runtimeConfig);
+        $refreshDecoded  = $this->decrypt($token, $refreshResponse, 'Refresh');
 
         return [
-            'success'        => true,
-            'response'       => $response,
-            'decoded'        => $decoded,
+            'success'         => true,
+            'response'        => $ownerResponse,
+            'decoded'         => $ownerDecoded,
             'partnerResponse' => $partnerResponse,
-            'partnerDecoded' => $partnerDecoded,
+            'partnerDecoded'  => $partnerDecoded,
+            'refreshResponse' => $refreshResponse,
+            'refreshDecoded'  => $refreshDecoded,
         ];
+    }
+
+    /** Decrypt a Mask response, returning null when it is not encrypted. */
+    private function decrypt(string $token, string $response, string $label): ?string {
+        try {
+            return LogaRpc::decryptBody($token, $response);
+        } catch (\Throwable $e) {
+            $this->logger->debug($label . ' response not encrypted: ' . substr($response, 0, 120), 'SplitCreator');
+            return null;
+        }
     }
 
     /**

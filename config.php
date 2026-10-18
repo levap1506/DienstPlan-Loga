@@ -122,6 +122,24 @@ if (!defined('LOGA_MASK_MONTH_ACTION')) {
 // ── Split creation via privateRPC ──────────────────────────────────────────
 // Captured MaskActionSrv.callMaskAction envelope that creates a Dienstsplit
 // (primary + partner). Placeholders are filled by LogaRpc::fill().
+// First Mask call of the split sequence (captured 2026-10-18): opens/creates
+// the owner split and carries the full employee list. It does NOT contain the
+// selected partner; the partner call below adds order 1.
+if (!defined('LOGA_SPLIT_OWNER_ACTION')) {
+    define('LOGA_SPLIT_OWNER_ACTION',
+        '7|3|45|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'
+        . '3jw|2vm|com.piag.lweb.ui.masks.shared.actions.Action|4k9|*|3k0|37f|SBK|'
+        . '4c060823-0fdb-43b0-b988-7377c71f3f49|8lz|4vl|y2em5e3qC1fcZrCggryW|LWSPEP|'
+        . '8mb|5q4|5jw|5w1|a673d0ad-03ae-4e11-8ff3-92fbece4ba1e|000|8m7|{FROM_DT}|{TO_DT}|'
+        . '8ke|5qg|{OBJEKT_ID}|4vh|8ks|9996555|3021652|9003137|9003722|3028559|3017484|3029731|'
+        . '3035683|3031857|3808197|3805098|3011872|1|2|3|4|5|6|4|7|8|9|10|7|11|12|0|13|LUT|13|LUx|'
+        . '0|0|14|15|16|0|17|18|0|0|0|19|0|0|0|0|0|0|0|0|0|0|8|20|0|21|40|10|2|22|0|23|24|25|26|'
+        . '27|26|28|0|29|0|14|30|-4|31|16|12|32|33|1|34|14|14|32|-20|35|14|14|32|-20|36|14|14|'
+        . '32|-20|37|14|14|32|-20|38|14|14|32|-20|39|14|14|32|-20|40|14|14|32|-20|41|14|14|'
+        . '32|-20|42|14|14|32|-20|43|14|14|32|-20|44|14|14|32|-20|45|14|14|'
+    );
+}
+
 // Second Mask call of the split sequence (captured 2026-10-18): creates the
 // partner part (order 1) for {PARTNER_PNR}. The owner part alone is created by
 // LOGA_SPLIT_ACTION_TEMPLATE; this call carries the partner PNR and the
