@@ -1,0 +1,12 @@
+# /etc/cron.d/dienstplan-loga-push
+# Push the current month's shifts to LOGA every 24h at 08:45:15 (Europe/Berlin).
+# cron has minute granularity, so the job sleeps 15 seconds after 08:45.
+#
+# Install (from the repository root):
+#   sudo cp loga/crontab /etc/cron.d/dienstplan-loga-push
+#   sudo chmod 644 /etc/cron.d/dienstplan-loga-push
+#   sudo systemctl restart cron
+#
+# Output: loga/logs/cron-push.log (git-ignored). Runs as www-data so it can
+# read .env and write cache/logs.
+45 8 * * * root sleep 15; /usr/sbin/runuser -u www-data -- /var/www/dp.dr-ritz.de/loga/push-current-month.sh

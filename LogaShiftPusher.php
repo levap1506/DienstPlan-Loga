@@ -718,14 +718,6 @@ class LogaShiftPusher {
 
     // ─── Dienstsplit creation (Mask action) ──────────────────────────────────
 
-    /**
-     * Build the Mask-action shift id from a REST shift id ('*|ÄDNCHR09|r2' →
-     * '*\!ÄDNCHR09\!r2').
-     */
-    private static function toMaskShiftId(string $originalId): string {
-        return str_replace('|', '\\!', $originalId);
-    }
-
     /** Whether any shift in the list uses the given shortcut. */
     private static function hasShortcut(array $shifts, string $shortcut): bool {
         foreach ($shifts as $shift) {
@@ -783,7 +775,7 @@ class LogaShiftPusher {
      * split shortcut as a plain (unlinked) shift, the group is left to the
      * normal REST path. A split that already exists in LOGA is skipped.
      *
-     * @return array<int,array{splitId:string,date:string,ownerPnr:string,partnerPnr:string,shortcut:string,maskShiftId:string}>
+     * @return array<int,array{splitId:string,date:string,ownerPnr:string,partnerPnr:string,shortcut:string,shiftOriginalId:string}>
      */
     private function collectMissingSplits(array $currentLogaData): array {
         $currentShifts = $this->extractCurrentShifts($currentLogaData);
@@ -835,8 +827,8 @@ class LogaShiftPusher {
                 'date'        => $date,
                 'ownerPnr'    => (string)$ownerPnr,
                 'partnerPnr'  => (string)$partnerPnr,
-                'shortcut'    => $shortcut,
-                'maskShiftId' => self::toMaskShiftId($this->shiftIdMap[$shortcut]),
+                'shortcut'        => $shortcut,
+                'shiftOriginalId' => $this->shiftIdMap[$shortcut],
             ];
         }
 
@@ -860,7 +852,7 @@ class LogaShiftPusher {
                     $intent['ownerPnr'],
                     $intent['partnerPnr'],
                     $intent['date'],
-                    $intent['maskShiftId'],
+                    $intent['shiftOriginalId'],
                     LOGA_SPLIT_OBJS_ID
                 );
                 $handled[$intent['ownerPnr']][$intent['date']] = true;
@@ -868,7 +860,7 @@ class LogaShiftPusher {
                 $created++;
                 $this->logger->info(
                     "Split created in LOGA: {$intent['date']} owner={$intent['ownerPnr']} "
-                    . "partner={$intent['partnerPnr']} shift={$intent['maskShiftId']}",
+                    . "partner={$intent['partnerPnr']} shift={$intent['shiftOriginalId']}",
                     'ShiftPusher'
                 );
             } catch (\Throwable $e) {
