@@ -58,6 +58,12 @@ class LogaSplitCreator {
         $version    = $this->runtimeConfig['logaVersion'] ?? '';
         $moduleBase = LOGA_BASE_URL . "bts/{$version}/L2Main/";
 
+        // The browser sends a date-bearing checkapprovals request immediately
+        // before the split Mask action. It is the only call in the sequence
+        // that carries the concrete target day; replay it so the mask applies
+        // the split to that day instead of the last selection.
+        $this->checkApprovals($ownerPnr, $date);
+
         // Establish the PEP mask context — without this every Mask call is HTTP 500.
         $this->bootstrapMask($moduleBase, $token, $date);
 
@@ -93,6 +99,50 @@ class LogaSplitCreator {
         );
 
         return ['success' => true, 'response' => $response, 'decoded' => $decoded];
+    }
+
+    /**
+     * Ask LOGA to validate the plan change for the concrete owner/date.
+     *
+     * Captured from the browser directly before the split Mask action. The
+     * request carries the target date, which the split envelope itself does
+     * not contain.
+     */
+    private function checkApprovals(string $ownerPnr, string $date): void {
+        $yearMonth = substr($date, 0, 7);
+        $from = $yearMonth . '-01';
+        $to   = date('Y-m-t', strtotime($from . '-01'));
+
+        $payload = [
+            'clientContext' => [
+                'interval'      => ['dateFrom' => $from, 'dateTo' => $to],
+                'countryNls'    => '000',
+                'man'           => LOGA_MANDANT,
+                'contextRoleId' => LOGA_CONTEXT_ROLE_ID,
+            ],
+            'objektPath' => LOGA_OBJEKT_PATH,
+            'person'     => [
+                'man'    => LOGA_MANDANT,
+                'ak'     => LOGA_MANDANT,
+                'pnr'    => $ownerPnr,
+                'vertnr' => 1,
+            ],
+            'date' => $date,
+        ];
+
+        try {
+            $response = $this->client->apiRequest('private/api/spepdatachangeservice/checkapprovals', $payload);
+            $this->logger->debug(
+                'checkapprovals ' . $date . ' → ' . json_encode($response),
+                'SplitCreator'
+            );
+        } catch (\Throwable $e) {
+            // Non-fatal: the split call itself is still attempted.
+            $this->logger->info(
+                'checkapprovals failed for ' . $date . ': ' . $e->getMessage(),
+                'SplitCreator'
+            );
+        }
     }
 
     /**
