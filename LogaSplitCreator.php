@@ -63,6 +63,7 @@ class LogaSplitCreator {
         // immediately before the split, exactly like the browser.
         $this->bootstrapMask($moduleBase, $token, $date);
         $this->checkApprovals($ownerPnr, $date);
+        $this->loadEmployeePlan($partnerPnr, $date);
 
         $this->logger->info(
             "Creating LOGA split: owner={$ownerPnr} partner={$partnerPnr} date={$date} shift={$shiftOriginalId}",
@@ -170,6 +171,46 @@ class LogaSplitCreator {
             // Non-fatal: the split call itself is still attempted.
             $this->logger->info(
                 'checkapprovals failed for ' . $date . ': ' . $e->getMessage(),
+                'SplitCreator'
+            );
+        }
+    }
+
+    /**
+     * Load the partner's employee plan into the mask context. The split
+     * dialog does this when a partner is selected; without it the second
+     * Mask call has no partner to attach to.
+     */
+    private function loadEmployeePlan(string $partnerPnr, string $date): void {
+        $yearMonth = substr($date, 0, 7);
+        $from = $yearMonth . '-01';
+        $to   = date('Y-m-t', strtotime($from . '-01'));
+
+        $payload = [
+            'clientContext' => [
+                'interval'      => ['dateFrom' => $from, 'dateTo' => $to],
+                'countryNls'    => '000',
+                'man'           => LOGA_MANDANT,
+                'contextRoleId' => LOGA_CONTEXT_ROLE_ID,
+            ],
+            'pathManAkPnrVertnr' => [[
+                'path' => ['path' => LOGA_OBJEKT_PATH],
+                'manAkPnrVertnr' => [
+                    'man'    => LOGA_MANDANT,
+                    'ak'     => LOGA_MANDANT,
+                    'pnr'    => $partnerPnr,
+                    'vertnr' => 1,
+                ],
+                'objektId' => LOGA_OBJEKT_ID,
+            ]],
+            'reloadAbsences' => false,
+        ];
+
+        try {
+            $this->client->apiRequest('private/api/spepdataservice/loademployeeplandata', $payload);
+        } catch (\Throwable $e) {
+            $this->logger->info(
+                'loademployeeplandata failed for partner ' . $partnerPnr . ': ' . $e->getMessage(),
                 'SplitCreator'
             );
         }
