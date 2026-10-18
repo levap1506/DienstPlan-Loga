@@ -1,12 +1,19 @@
 # /etc/cron.d/dienstplan-loga-push
-# Push the current month's shifts to LOGA every 24h at 08:45:15 (Europe/Berlin).
-# cron has minute granularity, so the job sleeps 15 seconds after 08:45.
+# Daily LOGA sync (Europe/Berlin). cron has minute granularity, so each job
+# sleeps 15 seconds after the minute to hit the requested :15 second mark.
+#
+# 08:40:15  pull absences: current month -3 .. +3 (7 months),
+#           strategy keep-local-all (keep existing shifts on conflict)
+# 08:45:15  push current month shifts
 #
 # Install (from the repository root):
 #   sudo cp loga/crontab /etc/cron.d/dienstplan-loga-push
 #   sudo chmod 644 /etc/cron.d/dienstplan-loga-push
 #   sudo systemctl restart cron
 #
-# Output: loga/logs/cron-push.log (git-ignored). Runs as www-data so it can
-# read .env and write cache/logs.
+# Output:
+#   loga/logs/cron-pull-absences.log (git-ignored)
+#   loga/logs/cron-push.log          (git-ignored)
+# Runs as www-data so it can read .env and write cache/logs.
+40 8 * * * root sleep 15; /usr/sbin/runuser -u www-data -- /var/www/dp.dr-ritz.de/loga/pull-absences-6m.sh
 45 8 * * * root sleep 15; /usr/sbin/runuser -u www-data -- /var/www/dp.dr-ritz.de/loga/push-current-month.sh
