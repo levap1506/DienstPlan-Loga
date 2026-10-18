@@ -58,14 +58,11 @@ class LogaSplitCreator {
         $version    = $this->runtimeConfig['logaVersion'] ?? '';
         $moduleBase = LOGA_BASE_URL . "bts/{$version}/L2Main/";
 
-        // The browser sends a date-bearing checkapprovals request immediately
-        // before the split Mask action. It is the only call in the sequence
-        // that carries the concrete target day; replay it so the mask applies
-        // the split to that day instead of the last selection.
-        $this->checkApprovals($ownerPnr, $date);
-
-        // Establish the PEP mask context — without this every Mask call is HTTP 500.
+        // Establish the PEP mask context first (the browser has it open long
+        // before the split). Then send the date-bearing checkapprovals call
+        // immediately before the split, exactly like the browser.
         $this->bootstrapMask($moduleBase, $token, $date);
+        $this->checkApprovals($ownerPnr, $date);
 
         $this->logger->info(
             "Creating LOGA split: owner={$ownerPnr} partner={$partnerPnr} date={$date} shift={$shiftOriginalId}",
