@@ -65,7 +65,10 @@ if (!defined('LOGA_SPECIAL_USERS')) {
 
 // ── Per-user base-shift overrides ──────────────────────────────────────────
 // Replace a user's base shift code within a date range.
-// Gutu (PNR 3017484): base shift is AT instead of O from 2026-10-01 to 2027-09-30.
+// Gutu (PNR 3017484): the real base shift is AT instead of O from 2026-10-01
+// to 2027-09-30, but AT is administered in LOGA and cannot be written by the
+// pusher. The pusher therefore: leaves days that already carry AT untouched,
+// adds O where nothing is planned, and keeps an existing O. Never pushes AT.
 // Format: pnr => [ ['from' => 'Y-m-d', 'to' => 'Y-m-d', 'fromShift' => 'O', 'toShift' => 'AT'], ... ]
 if (!defined('LOGA_BASE_SHIFT_OVERRIDES')) {
     define('LOGA_BASE_SHIFT_OVERRIDES', [

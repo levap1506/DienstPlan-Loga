@@ -69,17 +69,76 @@ class LogaShiftPusher {
     /**
      * Apply a per-user base-shift override (e.g. Gutu: AT instead of O within a
      * date range). Returns the shift unchanged when no rule matches.
+     *
+     * Protected target shifts (e.g. AT) are administered in LOGA and cannot be
+     * written by the pusher, so the original shift is kept for those days.
+     * calculateShiftChanges() then leaves days that already hold the protected
+     * target completely untouched and fills the remaining days with the
+     * original shift (O).
      */
     private function applyBaseShiftOverride(string $pnr, string $date, string $shift): string {
         foreach (LOGA_BASE_SHIFT_OVERRIDES[$pnr] ?? [] as $rule) {
             $from  = $rule['from'] ?? '0000-00-00';
             $to    = $rule['to'] ?? '9999-12-31';
             $match = $rule['fromShift'] ?? '';
-            if ($shift === $match && $date >= $from && $date <= $to) {
-                return (string)($rule['toShift'] ?? $shift);
+            if ($shift !== $match || $date < $from || $date > $to) {
+                continue;
             }
+
+            $toShift = (string)($rule['toShift'] ?? $shift);
+            if (self::isProtectedShortcut($toShift)) {
+                return $shift;
+            }
+            return $toShift;
         }
         return $shift;
+    }
+
+    /** Whether a shortcut is administered in LOGA and must not be pushed. */
+    private static function isProtectedShortcut(string $shortcut): bool {
+        $needle = strtoupper($shortcut);
+        foreach (LOGA_PROTECTED_SHIFTS as $protected) {
+            if (strtoupper((string)$protected) === $needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Case-insensitive shortcut lookup for a list of shift structs. */
+    private static function hasShortcutInsensitive(array $shifts, string $shortcut): bool {
+        $needle = strtoupper($shortcut);
+        foreach ($shifts as $shift) {
+            if (strtoupper(self::shortcutOf($shift)) === $needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether LOGA already holds the protected target shift of an active
+     * base-shift override for this user/date (e.g. Gutu's AT). Such days must
+     * be left completely untouched: neither the protected shift nor an O may
+     * be added or deleted there.
+     */
+    private function hasProtectedOverrideShift(string $pnr, string $date, array $shifts): bool {
+        if (empty($shifts)) {
+            return false;
+        }
+        foreach (LOGA_BASE_SHIFT_OVERRIDES[$pnr] ?? [] as $rule) {
+            $from = $rule['from'] ?? '0000-00-00';
+            $to   = $rule['to'] ?? '9999-12-31';
+            if ($date < $from || $date > $to) {
+                continue;
+            }
+            $target = (string)($rule['toShift'] ?? '');
+            if ($target !== '' && self::isProtectedShortcut($target)
+                && self::hasShortcutInsensitive($shifts, $target)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ─── Public Interface ───────────────────────────────────────────────────
@@ -421,33 +480,42 @@ class LogaShiftPusher {
             $this->logger->debug("Special user {$user['pnr']}: id=null, identifier=" . var_export($userIdentifier, true) . ", inMap=" . var_export(isset(LOGA_SPECIAL_USERS[$userIdentifier]), true) . ", currentShiftDates=" . count($currentLogaShifts) . ", isWorkDay({$testDate})=" . var_export($this->isWorkDay($testDate), true) . ", expected(" . $testDate . ")=" . json_encode($testExpected) . ", holidays=" . json_encode($this->holidays), 'ShiftPusher');
         }
 
-        // Schimburile protejate (ex. AT) sunt administrate în LOGA: nu trebuie
-        // nici adăugate, nici șterse prin planshifts, deci sunt ignorate pe
-        // ambele părți ale comparației (altfel LOGA răspunde
-        // „Die Schicht AT kann nicht gespeichert werden").
+        // Schimburile protejate (ex. AT) sunt administrate în LOGA și nu pot fi
+        // scrise de pusher. Zilele în care LOGA are deja ținta protejată a unui
+        // override (ex. AT la Gutu din 2026-10-01) rămân complet neatinse;
+        // oriunde altundeva se pune O unde nu există nimic, iar un O existent
+        // este păstrat.
         $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
-        $stripProtected = static fn(array $shifts): array => array_values(array_filter(
-            $shifts,
-            static fn($s) => !in_array(strtoupper(self::shortcutOf($s)), $protected, true)
-        ));
+        $isProtected = static fn($s): bool => in_array(strtoupper(self::shortcutOf($s)), $protected, true);
+        $pnr = isset($user['pnr']) ? (string)$user['pnr'] : null;
 
         while ($startDate <= $endDate) {
             $dateStr = $startDate->format('Y-m-d');
             $currentLogaShiftsForDate = $currentLogaShifts[$dateStr] ?? [];
 
-            $expectedCmp = $stripProtected(
-                $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries)
-            );
-            $currentCmp = $stripProtected($currentLogaShiftsForDate);
+            // Zile cu AT (sau altă țintă protejată) în LOGA: nu atingem nimic.
+            if ($pnr !== null && $this->hasProtectedOverrideShift($pnr, $dateStr, $currentLogaShiftsForDate)) {
+                $startDate->modify('+1 day');
+                continue;
+            }
 
-            if (!$this->shiftsMatch($expectedCmp, $currentCmp)) {
-                $changes[] = [
-                    'date'           => $dateStr,
-                    'currentShifts'  => $currentCmp,
-                    'expectedShifts' => $expectedCmp,
-                    'toDelete'       => $currentCmp,
-                    'toAdd'          => $expectedCmp,
-                ];
+            $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
+
+            if (!$this->shiftsMatch($expectedShifts, $currentLogaShiftsForDate)) {
+                // Never delete protected shortcuts (e.g. AT is managed in LOGA).
+                $toDelete = array_values(array_filter(
+                    $currentLogaShiftsForDate,
+                    static fn($s) => !$isProtected($s)
+                ));
+                if (!empty($toDelete) || !empty($expectedShifts)) {
+                    $changes[] = [
+                        'date'           => $dateStr,
+                        'currentShifts'  => $currentLogaShiftsForDate,
+                        'expectedShifts' => $expectedShifts,
+                        'toDelete'       => $toDelete,
+                        'toAdd'          => $expectedShifts,
+                    ];
+                }
             }
 
             $startDate->modify('+1 day');
