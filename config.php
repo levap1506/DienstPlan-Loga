@@ -122,6 +122,20 @@ if (!defined('LOGA_MASK_MONTH_ACTION')) {
 // ── Split creation via privateRPC ──────────────────────────────────────────
 // Captured MaskActionSrv.callMaskAction envelope that creates a Dienstsplit
 // (primary + partner). Placeholders are filled by LogaRpc::fill().
+// Second Mask call of the split sequence (captured 2026-10-18): creates the
+// partner part (order 1) for {PARTNER_PNR}. The owner part alone is created by
+// LOGA_SPLIT_ACTION_TEMPLATE; this call carries the partner PNR and the
+// order-1/time tokens LT1/LUS.
+if (!defined('LOGA_SPLIT_PARTNER_ACTION')) {
+    define('LOGA_SPLIT_PARTNER_ACTION',
+        '7|3|31|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'
+        . '3jw|2vm|com.piag.lweb.ui.masks.shared.actions.Action|4k9|SBK|3k0|37f|4c060823-0fdb-43b0-b988-7377c71f3f49|'
+        . '8lz|4vl|y2em5e3qC1fcZrCggryW|LWSPEP|{PARTNER_PNR}|8ks|8mb|5q4|5jw|5w1|000|8m7|{FROM_DT}|{TO_DT}|'
+        . '8ke|5r0|{OBJEKT_ID}|1|2|3|4|5|6|4|7|8|9|10|7|11|12|0|13|LT1|13|LUS|0|0|11|14|15|0|16|17|0|0|0|18|'
+        . '0|0|0|0|0|0|0|19|0|20|1|8|21|0|22|18|10|2|23|0|24|0|25|26|27|26|28|0|29|0|11|30|31|'
+    );
+}
+
 if (!defined('LOGA_SPLIT_ACTION_TEMPLATE')) {
     define('LOGA_SPLIT_ACTION_TEMPLATE',
         '7|3|37|{MODULE_BASE}|009B0BB5230AFAE10C0B84C2F1B1ACB2|49|{TOKEN}|_|callMaskAction|'

@@ -98,7 +98,38 @@ class LogaSplitCreator {
             'SplitCreator'
         );
 
-        return ['success' => true, 'response' => $response, 'decoded' => $decoded];
+        // The browser sends a second Mask call that creates the partner part
+        // (order 1). Without it, only the owner part persists.
+        $partnerResponse = '';
+        $partnerDecoded  = null;
+        if (defined('LOGA_SPLIT_PARTNER_ACTION')) {
+            $partnerEnvelope = LogaRpc::fill(LOGA_SPLIT_PARTNER_ACTION, [
+                'MODULE_BASE' => $moduleBase,
+                'TOKEN'       => $token,
+                'PARTNER_PNR' => $partnerPnr,
+                'FROM_DT'     => $from,
+                'TO_DT'       => $to,
+                'OBJEKT_ID'   => LOGA_OBJEKT_ID,
+            ]);
+            $partnerResponse = $this->client->privateRpc('MaskActionSrv', $partnerEnvelope, $this->runtimeConfig);
+            try {
+                $partnerDecoded = LogaRpc::decryptBody($token, $partnerResponse);
+            } catch (\Throwable $e) {
+                $this->logger->debug('Partner response not encrypted: ' . substr($partnerResponse, 0, 120), 'SplitCreator');
+            }
+            $this->logger->info(
+                'Partner split response: ' . substr($partnerDecoded ?? $partnerResponse, 0, 300),
+                'SplitCreator'
+            );
+        }
+
+        return [
+            'success'        => true,
+            'response'       => $response,
+            'decoded'        => $decoded,
+            'partnerResponse' => $partnerResponse,
+            'partnerDecoded' => $partnerDecoded,
+        ];
     }
 
     /**
