@@ -24,6 +24,8 @@ class LogaShiftPuller {
     private mysqli $conn;
     private LogaLogger $logger;
     private LogaProcessor $processor;
+    /** @var array<int,bool>|null LOGA shift ids whose shortcuts are protected (e.g. AT). */
+    private ?array $protectedShiftIds = null;
 
     public function __construct(mysqli $conn, ?LogaLogger $logger = null, ?LogaProcessor $processor = null) {
         $this->conn = $conn;
@@ -432,6 +434,36 @@ class LogaShiftPuller {
     }
 
     /**
+     * LOGA shift ids whose shortcut is protected (administered in LOGA, e.g. AT).
+     * They have no cellvalue mapping, so they are ignored by the value diff, but
+     * a date carrying one must still be treated as LOGA-managed (never deleted).
+     *
+     * @return array<int,bool>
+     */
+    private function getProtectedShiftIds(): array {
+        if ($this->protectedShiftIds !== null) {
+            return $this->protectedShiftIds;
+        }
+        $this->protectedShiftIds = [];
+        $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
+        if (!empty($protected)) {
+            $placeholders = implode(',', array_fill(0, count($protected), '?'));
+            $stmt = $this->conn->prepare(
+                "SELECT id FROM loga_shiftlist WHERE UPPER(shortcut) IN ({$placeholders})"
+            );
+            $types = str_repeat('s', count($protected));
+            $stmt->bind_param($types, ...$protected);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            while ($row = $result->fetch_assoc()) {
+                $this->protectedShiftIds[(int)$row['id']] = true;
+            }
+            $stmt->close();
+        }
+        return $this->protectedShiftIds;
+    }
+
+    /**
      * Detect local shifts that are no longer in LOGA (for deletion).
      */
     private function detectDeletions(
@@ -451,15 +483,18 @@ class LogaShiftPuller {
         $logaManagedCellvalues = array_unique(array_map(fn($s) => $s['cellvalueid'], $shiftToCellvalue));
         if (empty($logaManagedCellvalues)) return $deletions;
 
-        // Build set of LOGA dates per uid
+        // Build set of LOGA dates per uid. A date counts as LOGA-managed when
+        // LOGA has any mapped shift OR a protected shift (e.g. AT) there, so an
+        // AT day is never mistaken for an empty day and its local O is kept.
+        $protectedShiftIds = $this->getProtectedShiftIds();
         $logaDatesPerUid = [];
         foreach ($personsShifts as $person) {
             $uid = $pnrToUid[$person['pnr']] ?? null;
             if (!$uid) continue;
             if (!isset($logaDatesPerUid[$uid])) $logaDatesPerUid[$uid] = [];
             foreach ($person['dates'] as $entry) {
-                $shiftId = $entry['id'];
-                if (isset($shiftToCellvalue[$shiftId])) {
+                $shiftId = (int)$entry['id'];
+                if (isset($shiftToCellvalue[$shiftId]) || isset($protectedShiftIds[$shiftId])) {
                     $logaDatesPerUid[$uid][$entry['date']] = true;
                 }
             }
