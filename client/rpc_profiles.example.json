@@ -28,13 +28,14 @@
         {
           "rpc_service": "maskActionService",
           "mask": "LZWZEITD",
-          "envelope": "7|3|14|{{L2_MODULE_BASE}}|B0DCAB5410DA1EFFB4E3F4A1A02669CE|49|{{XSRF}}|_|actionMask|8l4|22p|{{MASK_INSTANCE}}$generateTimeDocument|2wa|{{MAN}}{{AK}}{{PNR}}1|2vh|37j|37i|1|2|3|4|5|6|2|7|8|9|8|2|10|7|11|12|13|14|LTW|14|LT0|"
+          "envelope": "7|3|14|{{L2_MODULE_BASE}}|B0DCAB5410DA1EFFB4E3F4A1A02669CE|49|{{XSRF}}|_|actionMask|8l4|22p|{{MASK_INSTANCE}}$generateTimeDocument|2wa|{{MAN}}{{AK}}{{PNR}}1|2vh|37j|37i|1|2|3|4|5|6|2|7|8|9|8|2|10|7|11|12|13|14|LTW|14|LT0|",
+          "extract": {
+            "DOCUMENT_ID": "(\\d+),\\[\""
+          }
         }
       ],
       "download": {
-        "poll_dashboard": true,
-        "title_regex": "(Zeitprotokoll|Zeitdaten|Zeit)",
-        "timeout_seconds": 90
+        "url": "private/document?document-id={{DOCUMENT_ID}}"
       }
     }
   }
