@@ -79,6 +79,9 @@ if (!defined('LOGA_BASE_SHIFT_OVERRIDES')) {
 }
 
 // Shift shortcuts that must never be deleted by the pusher (e.g. managed in LOGA).
+// In addition, the pusher only deletes the codes it manages itself (O/A,
+// O1-O4, R/r1/r2/R3/R4, 80, CA and override codes). Shifts of other
+// departments therefore stay untouched even without being listed here.
 if (!defined('LOGA_PROTECTED_SHIFTS')) {
     define('LOGA_PROTECTED_SHIFTS', ['AT']);
 }

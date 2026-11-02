@@ -11,6 +11,9 @@
  *   - R-shift casing: r1/r2 lowercase, R3/R4 uppercase
  *   - Special users: hardcoded shifts (80/O/CA)
  *   - Base shift: from user_dienstart table (dienstart=2→O, else→A)
+ *   - Only pusher-managed codes are deleted; foreign shifts (other
+ *     departments) and protected shifts (AT) are preserved
+ *   - Rufdienst (valid=2) is added on top of an existing base shift
  * 
  * @author  DienstPlan System
  * @date    2026-04-17
@@ -34,6 +37,8 @@ class LogaShiftPusher {
     private string $dateTo;
     private array $holidays = [];
     private array $shiftIdMap = [];
+    /** @var array<string,?string> "uid|date" => base shift (cached per run) */
+    private array $baseShiftCache = [];
     /** @var array<int,string> local user id => LOGA PNR */
     private array $uidToPnr = [];
     /** Lazily created Mask-action split creator (Dienstsplit). */
@@ -73,8 +78,9 @@ class LogaShiftPusher {
      * Protected target shifts (e.g. AT) are administered in LOGA and cannot be
      * written by the pusher, so the original shift is kept for those days.
      * calculateShiftChanges() then leaves days that already hold the protected
-     * target completely untouched and fills the remaining days with the
-     * original shift (O).
+     * target untouched and fills the remaining days with the original shift
+     * (O). Exception: on Rufdienst days (plan valid=2) the R shifts are added
+     * on top of the existing protected/base shift without changing it.
      */
     private function applyBaseShiftOverride(string $pnr, string $date, string $shift): string {
         foreach (LOGA_BASE_SHIFT_OVERRIDES[$pnr] ?? [] as $rule) {
@@ -370,6 +376,11 @@ class LogaShiftPusher {
      * dienstart=2 → 'O', else → 'A'
      */
     private function getBaseShift(int $uid, string $date): ?string {
+        $cacheKey = $uid . '|' . $date;
+        if (array_key_exists($cacheKey, $this->baseShiftCache)) {
+            return $this->baseShiftCache[$cacheKey];
+        }
+
         $stmt = $this->conn->prepare(
             "SELECT dienstart FROM user_dienstart WHERE uid = ? AND gueltigab <= ? AND gueltigbis >= ? ORDER BY gueltigab DESC LIMIT 1"
         );
@@ -383,6 +394,7 @@ class LogaShiftPusher {
         }
         $stmt->close();
 
+        $this->baseShiftCache[$cacheKey] = $baseShift;
         return $baseShift;
     }
 
@@ -489,18 +501,64 @@ class LogaShiftPusher {
             $this->logger->debug("Special user {$user['pnr']}: id=null, identifier=" . var_export($userIdentifier, true) . ", inMap=" . var_export(isset(LOGA_SPECIAL_USERS[$userIdentifier]), true) . ", currentShiftDates=" . count($currentLogaShifts) . ", isWorkDay({$testDate})=" . var_export($this->isWorkDay($testDate), true) . ", expected(" . $testDate . ")=" . json_encode($testExpected) . ", holidays=" . json_encode($this->holidays), 'ShiftPusher');
         }
 
-        // Schimburile protejate (ex. AT) sunt administrate în LOGA și nu pot fi
-        // scrise de pusher. Zilele în care LOGA are deja ținta protejată a unui
-        // override (ex. AT la Gutu din 2026-10-01) rămân complet neatinse;
-        // oriunde altundeva se pune O unde nu există nimic, iar un O existent
-        // este păstrat.
-        $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
-        $isProtected = static fn($s): bool => in_array(strtoupper(self::shortcutOf($s)), $protected, true);
+        // Reguli de bază:
+        //   - Ștergem doar codurile pe care le administrează pusher-ul (O/A,
+        //     O1-O4, R/r1/r2/R3/R4, 80, CA și codurile din override).
+        //     Shifturile altor abteilungen și cele protejate (ex. AT) rămân
+        //     neatinse.
+        //   - Zilele în care LOGA are deja ținta protejată a unui override
+        //     (ex. AT la Gutu din 2026-10-01) rămân complet neatinse.
+        //   - Oriunde nu există nimic se pune O. Dacă ziua conține deja un
+        //     shift străin, acesta ține locul shiftului de bază.
+        //   - Pe zilele de Rufdienst (plan valid=2) R-ul se adaugă peste
+        //     shiftul de bază existent, fără a-l schimba.
         $pnr = isset($user['pnr']) ? (string)$user['pnr'] : null;
 
         while ($startDate <= $endDate) {
             $dateStr = $startDate->format('Y-m-d');
             $currentLogaShiftsForDate = $currentLogaShifts[$dateStr] ?? [];
+            $planEntry = $planEntries[$dateStr] ?? null;
+            $planValue = is_array($planEntry) ? (int)$planEntry['valid'] : null;
+            $baseShift = $this->resolveBaseShift($userIdentifier, $dateStr);
+
+            // ── Rufdienst (plan valid=2) ────────────────────────────────────
+            // Adăugăm R-ul peste shiftul de bază deja existent (ex. AT la
+            // Gutu) și reconciliem doar turele de Rufdienst. Shiftul de bază
+            // și shifturile străine nu sunt niciodată modificate aici.
+            if ($planValue === 2) {
+                $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
+
+                $dutyCurrent = array_values(array_filter(
+                    $currentLogaShiftsForDate,
+                    fn($s) => $this->isManagedShift($s)
+                        && !self::isProtectedShortcut(self::shortcutOf($s))
+                        && !$this->isBaseShiftCandidate($s, $baseShift)
+                ));
+
+                [$toDelete, $toAdd] = $this->diffShifts($expectedShifts, $dutyCurrent);
+
+                if (!empty($toDelete) || !empty($toAdd)) {
+                    // Keep base/foreign shifts visible in the log/expected set
+                    // even though they are not part of the diff.
+                    $preserved = array_values(array_filter(
+                        $currentLogaShiftsForDate,
+                        fn($s) => !$this->isManagedShift($s)
+                            || self::isProtectedShortcut(self::shortcutOf($s))
+                            || $this->isBaseShiftCandidate($s, $baseShift)
+                    ));
+
+                    $changes[] = [
+                        'date'           => $dateStr,
+                        'currentShifts'  => $currentLogaShiftsForDate,
+                        'expectedShifts' => array_merge($expectedShifts, $preserved),
+                        'toDelete'       => $toDelete,
+                        'toAdd'          => $toAdd,
+                    ];
+                }
+
+                $startDate->modify('+1 day');
+                continue;
+            }
 
             // Zile cu AT (sau altă țintă protejată) în LOGA: nu atingem nimic.
             if ($pnr !== null && $this->hasProtectedOverrideShift($pnr, $dateStr, $currentLogaShiftsForDate)) {
@@ -510,27 +568,146 @@ class LogaShiftPusher {
 
             $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
 
-            if (!$this->shiftsMatch($expectedShifts, $currentLogaShiftsForDate)) {
-                // Never delete protected shortcuts (e.g. AT is managed in LOGA).
-                $toDelete = array_values(array_filter(
-                    $currentLogaShiftsForDate,
-                    static fn($s) => !$isProtected($s)
-                ));
-                if (!empty($toDelete) || !empty($expectedShifts)) {
-                    $changes[] = [
-                        'date'           => $dateStr,
-                        'currentShifts'  => $currentLogaShiftsForDate,
-                        'expectedShifts' => $expectedShifts,
-                        'toDelete'       => $toDelete,
-                        'toAdd'          => $expectedShifts,
-                    ];
+            // Shifts we manage (known and not protected). Unknown/foreign and
+            // protected shifts are opaque: they are kept and they already
+            // occupy the day, so no home base shift is added on top.
+            $managedCurrent = [];
+            $hasOpaque = false;
+            foreach ($currentLogaShiftsForDate as $shift) {
+                if ($this->isManagedShift($shift) && !self::isProtectedShortcut(self::shortcutOf($shift))) {
+                    $managedCurrent[] = $shift;
+                } else {
+                    $hasOpaque = true;
                 }
+            }
+
+            if ($hasOpaque) {
+                // A foreign/protected shift already fills the base slot: do
+                // not add a base shift, and do not delete an existing one.
+                $expectedShifts = array_values(array_filter(
+                    $expectedShifts,
+                    fn($s) => !$this->isBaseShiftCandidate($s, $baseShift)
+                ));
+                $managedCurrent = array_values(array_filter(
+                    $managedCurrent,
+                    fn($s) => !$this->isBaseShiftCandidate($s, $baseShift)
+                ));
+            }
+
+            [$toDelete, $toAdd] = $this->diffShifts($expectedShifts, $managedCurrent);
+
+            if (!empty($toDelete) || !empty($toAdd)) {
+                $changes[] = [
+                    'date'           => $dateStr,
+                    'currentShifts'  => $currentLogaShiftsForDate,
+                    'expectedShifts' => $expectedShifts,
+                    'toDelete'       => $toDelete,
+                    'toAdd'          => $toAdd,
+                ];
             }
 
             $startDate->modify('+1 day');
         }
 
         return $changes;
+    }
+
+    /**
+     * Whether the pusher is allowed to delete this shift.
+     *
+     * Only shift codes the pusher itself can create are managed. Everything
+     * else (e.g. shifts of other departments, AT, custom codes) is unknown and
+     * therefore preserved, even if it happens to be mapped to a cellvalue.
+     */
+    private function isManagedShift($shift): bool {
+        $shortcut = strtoupper(self::shortcutOf($shift));
+        if ($shortcut === '') {
+            return false;
+        }
+        if (self::isPusherManagedShortcut($shortcut)) {
+            return true;
+        }
+        // A base-shift override may introduce an additional code.
+        foreach (LOGA_BASE_SHIFT_OVERRIDES as $rules) {
+            foreach ($rules as $rule) {
+                if (strtoupper((string)($rule['fromShift'] ?? '')) === $shortcut
+                    || strtoupper((string)($rule['toShift'] ?? '')) === $shortcut) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Shift codes generated by the pusher, even if they lack a mapping. */
+    private static function isPusherManagedShortcut(string $shortcut): bool {
+        return (bool)preg_match('/^(O[1-4]?|A|R[1-4]?|80|CA)$/', strtoupper($shortcut));
+    }
+
+    /**
+     * Whether a shift acts as the user's base shift on that day (e.g. Gutu's
+     * O/AT). Base shifts are preserved on Rufdienst days.
+     */
+    private function isBaseShiftCandidate($shift, ?string $baseShift): bool {
+        $shortcut = strtoupper(self::shortcutOf($shift));
+        if ($baseShift !== null && $shortcut === strtoupper($baseShift)) {
+            return true;
+        }
+        if (in_array($shortcut, ['O', 'A'], true)) {
+            return true;
+        }
+        return self::isProtectedShortcut($shortcut);
+    }
+
+    /**
+     * Base shift (after per-user overrides) for a user/date, or the hardcoded
+     * shift for LOGA-only special users.
+     */
+    private function resolveBaseShift($userIdOrPnr, string $date): ?string {
+        $pnrKey = (string)$userIdOrPnr;
+        if (isset(LOGA_SPECIAL_USERS[$pnrKey])) {
+            return (string)LOGA_SPECIAL_USERS[$pnrKey]['shift'];
+        }
+
+        $uid = (int)$userIdOrPnr;
+        $baseShift = $this->getBaseShift($uid, $date);
+        if ($baseShift === null) {
+            return null;
+        }
+
+        $pnr = $this->uidToPnr[$uid] ?? null;
+        if ($pnr !== null) {
+            $baseShift = $this->applyBaseShiftOverride($pnr, $date, $baseShift);
+        }
+        return $baseShift;
+    }
+
+    /**
+     * Multiset diff: returns [toDelete, toAdd] for the managed shifts.
+     * Expected shifts carrying split metadata only match a current shift with
+     * the same order (same rule as shiftsMatch()).
+     */
+    private function diffShifts(array $expected, array $current): array {
+        $remaining = $current;
+        $toAdd = [];
+
+        foreach ($expected as $expectedShift) {
+            $matchIndex = null;
+            foreach ($remaining as $index => $currentShift) {
+                if (self::shortcutOf($expectedShift) === self::shortcutOf($currentShift)
+                    && $this->splitSatisfied($expectedShift, $currentShift)) {
+                    $matchIndex = $index;
+                    break;
+                }
+            }
+            if ($matchIndex === null) {
+                $toAdd[] = $expectedShift;
+            } else {
+                unset($remaining[$matchIndex]);
+            }
+        }
+
+        return [array_values($remaining), $toAdd];
     }
 
     /**
