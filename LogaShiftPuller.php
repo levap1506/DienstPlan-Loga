@@ -24,11 +24,16 @@ class LogaShiftPuller {
     private mysqli $conn;
     private LogaLogger $logger;
     private LogaProcessor $processor;
+    /** @var array<int,bool>|null LOGA shift ids whose shortcuts are protected (e.g. AT). */
+    private ?array $protectedShiftIds = null;
+    /** @var string[] PNRs allowed to have shifts from other departments */
+    private array $multiDepartmentPnrs = [];
 
     public function __construct(mysqli $conn, ?LogaLogger $logger = null, ?LogaProcessor $processor = null) {
         $this->conn = $conn;
         $this->logger = $logger ?? LogaLogger::getInstance();
         $this->processor = $processor ?? new LogaProcessor($conn, $this->logger);
+        $this->multiDepartmentPnrs = array_map('strval', LOGA_MULTI_DEPARTMENT_PNRS);
     }
 
     /**
@@ -432,6 +437,36 @@ class LogaShiftPuller {
     }
 
     /**
+     * LOGA shift ids whose shortcut is protected (administered in LOGA, e.g. AT).
+     * Used for users without foreign shifts: a date carrying one counts as
+     * occupied so the local O is not considered orphaned.
+     *
+     * @return array<int,bool>
+     */
+    private function getProtectedShiftIds(): array {
+        if ($this->protectedShiftIds !== null) {
+            return $this->protectedShiftIds;
+        }
+        $this->protectedShiftIds = [];
+        $protected = array_map('strtoupper', LOGA_PROTECTED_SHIFTS);
+        if (!empty($protected)) {
+            $placeholders = implode(',', array_fill(0, count($protected), '?'));
+            $stmt = $this->conn->prepare(
+                "SELECT id FROM loga_shiftlist WHERE UPPER(shortcut) IN ({$placeholders})"
+            );
+            $types = str_repeat('s', count($protected));
+            $stmt->bind_param($types, ...$protected);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            while ($row = $result->fetch_assoc()) {
+                $this->protectedShiftIds[(int)$row['id']] = true;
+            }
+            $stmt->close();
+        }
+        return $this->protectedShiftIds;
+    }
+
+    /**
      * Detect local shifts that are no longer in LOGA (for deletion).
      */
     private function detectDeletions(
@@ -451,18 +486,27 @@ class LogaShiftPuller {
         $logaManagedCellvalues = array_unique(array_map(fn($s) => $s['cellvalueid'], $shiftToCellvalue));
         if (empty($logaManagedCellvalues)) return $deletions;
 
-        // Build set of LOGA dates per uid. Every shift returned by LOGA counts
-        // as "something is planned that day", even shifts that are not mapped
-        // to a local cellvalue (e.g. shifts from other departments or AT).
-        // Those days must never be mistaken for empty days, otherwise a local
-        // shift would be deleted although LOGA has a foreign shift there.
+        // Build set of LOGA dates per uid.
+        // Users in LOGA_MULTI_DEPARTMENT_PNRS may have shifts from other
+        // departments: for them every LOGA shift counts as "occupied", even if
+        // it has no local cellvalue mapping. For all other users only mapped or
+        // protected shifts count (previous behaviour).
+        $preserveForeignPnrs = $this->multiDepartmentPnrs;
+        $protectedShiftIds = $this->getProtectedShiftIds();
         $logaDatesPerUid = [];
         foreach ($personsShifts as $person) {
             $uid = $pnrToUid[$person['pnr']] ?? null;
             if (!$uid) continue;
             if (!isset($logaDatesPerUid[$uid])) $logaDatesPerUid[$uid] = [];
+
+            $countAnyShift = in_array((string)$person['pnr'], $preserveForeignPnrs, true);
             foreach ($person['dates'] as $entry) {
-                $logaDatesPerUid[$uid][$entry['date']] = true;
+                $shiftId = (int)$entry['id'];
+                if ($countAnyShift
+                    || isset($shiftToCellvalue[$shiftId])
+                    || isset($protectedShiftIds[$shiftId])) {
+                    $logaDatesPerUid[$uid][$entry['date']] = true;
+                }
             }
         }
 

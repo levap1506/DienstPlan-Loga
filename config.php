@@ -79,11 +79,20 @@ if (!defined('LOGA_BASE_SHIFT_OVERRIDES')) {
 }
 
 // Shift shortcuts that must never be deleted by the pusher (e.g. managed in LOGA).
-// In addition, the pusher only deletes the codes it manages itself (O/A,
-// O1-O4, R/r1/r2/R3/R4, 80, CA and override codes). Shifts of other
-// departments therefore stay untouched even without being listed here.
 if (!defined('LOGA_PROTECTED_SHIFTS')) {
     define('LOGA_PROTECTED_SHIFTS', ['AT']);
+}
+
+// Users whose LOGA plan may contain shifts from other departments.
+// For these users the pusher:
+//   - never deletes unknown/foreign shifts (only its own shift codes),
+//   - adds the base O only when the day is really empty,
+//   - adds Rufdienst (R/r{suffix}) on top of an existing base shift instead of
+//     replacing it.
+// All other users keep the previous push behaviour.
+// Default: Gutu (PNR 3017484).
+if (!defined('LOGA_MULTI_DEPARTMENT_PNRS')) {
+    define('LOGA_MULTI_DEPARTMENT_PNRS', ['3017484']);
 }
 
 // ── Dienstsplit creation via the Mask action ───────────────────────────────

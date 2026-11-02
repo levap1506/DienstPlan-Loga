@@ -39,6 +39,8 @@ class LogaShiftPusher {
     private array $shiftIdMap = [];
     /** @var array<string,?string> "uid|date" => base shift (cached per run) */
     private array $baseShiftCache = [];
+    /** @var string[] PNRs allowed to have shifts from other departments */
+    private array $multiDepartmentPnrs = [];
     /** @var array<int,string> local user id => LOGA PNR */
     private array $uidToPnr = [];
     /** Lazily created Mask-action split creator (Dienstsplit). */
@@ -58,6 +60,7 @@ class LogaShiftPusher {
         $this->dateFrom = $dateFrom;
         $this->dateTo = $dateTo;
         $this->logger = $logger ?? LogaLogger::getInstance();
+        $this->multiDepartmentPnrs = array_map('strval', LOGA_MULTI_DEPARTMENT_PNRS);
 
         $this->loadHolidays();
         $this->loadShiftIdMap();
@@ -501,24 +504,62 @@ class LogaShiftPusher {
             $this->logger->debug("Special user {$user['pnr']}: id=null, identifier=" . var_export($userIdentifier, true) . ", inMap=" . var_export(isset(LOGA_SPECIAL_USERS[$userIdentifier]), true) . ", currentShiftDates=" . count($currentLogaShifts) . ", isWorkDay({$testDate})=" . var_export($this->isWorkDay($testDate), true) . ", expected(" . $testDate . ")=" . json_encode($testExpected) . ", holidays=" . json_encode($this->holidays), 'ShiftPusher');
         }
 
-        // Reguli de bază:
+        // Reguli pentru utilizatorii din LOGA_MULTI_DEPARTMENT_PNRS (Gutu):
         //   - Ștergem doar codurile pe care le administrează pusher-ul (O/A,
         //     O1-O4, R/r1/r2/R3/R4, 80, CA și codurile din override).
         //     Shifturile altor abteilungen și cele protejate (ex. AT) rămân
         //     neatinse.
         //   - Zilele în care LOGA are deja ținta protejată a unui override
-        //     (ex. AT la Gutu din 2026-10-01) rămân complet neatinse.
+        //     (ex. AT la Gutu din 2026-10-01) rămân neatinse, cu excepția
+        //     reconcilierii Rufdienst.
         //   - Oriunde nu există nimic se pune O. Dacă ziua conține deja un
         //     shift străin, acesta ține locul shiftului de bază.
         //   - Pe zilele de Rufdienst (plan valid=2) R-ul se adaugă peste
         //     shiftul de bază existent, fără a-l schimba.
         $pnr = isset($user['pnr']) ? (string)$user['pnr'] : null;
+        // The merge/preserve behaviour only applies to users whose LOGA plan
+        // may contain shifts from other departments (default: Gutu).
+        $preserveForeign = $pnr !== null
+            && in_array($pnr, $this->multiDepartmentPnrs, true);
 
         while ($startDate <= $endDate) {
             $dateStr = $startDate->format('Y-m-d');
             $currentLogaShiftsForDate = $currentLogaShifts[$dateStr] ?? [];
             $planEntry = $planEntries[$dateStr] ?? null;
             $planValue = is_array($planEntry) ? (int)$planEntry['valid'] : null;
+
+            // ── Comportament vechi pentru ceilalți utilizatori ──────────────
+            // Doar utilizatorii din LOGA_MULTI_DEPARTMENT_PNRS pot avea shifturi
+            // de la alte abteilungen. Pentru restul păstrăm exact logica veche:
+            // se șterge tot ce nu e protejat și se adaugă ce se așteaptă.
+            if (!$preserveForeign) {
+                if ($pnr !== null && $this->hasProtectedOverrideShift($pnr, $dateStr, $currentLogaShiftsForDate)) {
+                    $startDate->modify('+1 day');
+                    continue;
+                }
+
+                $expectedShifts = $this->calculateExpectedShifts($userIdentifier, $dateStr, $planEntries);
+
+                if (!$this->shiftsMatch($expectedShifts, $currentLogaShiftsForDate)) {
+                    $toDelete = array_values(array_filter(
+                        $currentLogaShiftsForDate,
+                        static fn($s) => !self::isProtectedShortcut(self::shortcutOf($s))
+                    ));
+                    if (!empty($toDelete) || !empty($expectedShifts)) {
+                        $changes[] = [
+                            'date'           => $dateStr,
+                            'currentShifts'  => $currentLogaShiftsForDate,
+                            'expectedShifts' => $expectedShifts,
+                            'toDelete'       => $toDelete,
+                            'toAdd'          => $expectedShifts,
+                        ];
+                    }
+                }
+
+                $startDate->modify('+1 day');
+                continue;
+            }
+
             $baseShift = $this->resolveBaseShift($userIdentifier, $dateStr);
 
             // ── Rufdienst (plan valid=2) ────────────────────────────────────
